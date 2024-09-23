@@ -1,0 +1,36 @@
+input:
+  broker_pod_metrics:
+    namespace: ${NAMESPACE}
+    pod: ${POD_PREFIX}-${ORDINAL}
+    container: redpanda
+    labels:
+      kubernetes_image: $.spec.containers[0].image
+      kubernetes_node: $.spec.nodeName
+      kubernetes_pod_id: $.metadata.uid
+      kubernetes_host: $.spec.hostname
+      kubernetes_pod: $.metadata.name
+      kubernetes_namespace: $.metadata.namespace
+      kubernetes_container: $.spec.containers[0].name
+
+pipeline:
+  processors:
+    - mimir_processor: {}
+    - protobuf:
+        operator: from_json
+        message: cortexpb.WriteRequest
+        import_paths: [ schemas ]
+    - catch:
+        - mapping: |
+            root = deleted()
+    - compress:
+        algorithm: snappy
+
+output:
+  http_client:
+    url: ${MIMIR_URL}
+    verb: POST
+    timeout: 5s
+    basic_auth:
+      enabled: true
+      username: ${MIMIR_USERNAME}
+      password: ${MIMIR_PASSWORD}

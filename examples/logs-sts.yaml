@@ -1,0 +1,60 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: logs-forwarder
+  labels:
+    app: logs-forwarder
+spec:
+  clusterIP: None
+  selector:
+    app: logs-forwarder
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: logs-forwarder
+  labels:
+    app: logs-forwarder
+spec:
+  serviceName: "logs-forwarder"
+  selector:
+    matchLabels:
+      app: logs-forwarder
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: logs-forwarder
+    spec:
+      containers:
+        - name: logs-forwarder
+          image: docker.redpanda.com/redpandadata/connect:0.0.1
+          command: ["/redpanda-connect", "run", "/config/logs-forwarder.yaml"]
+          volumeMounts:
+            - name: logs-forwarder
+              mountPath: /config
+          env:
+            - name: NAMESPACE
+              value: green
+            - name: POD_PREFIX
+              value: green
+            - name: ORDINAL
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+            - name: LOKI_INSTANCE_NAME
+              value: "grafanacloud-paulmwilkinson-logs"
+            - name: LOKI_URL
+              value: "https://logs-prod-012.grafana.net/loki/api/v1/push"
+            - name: LOKI_USERNAME
+              value: "997552"
+            - name: LOKI_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-cloud-password
+                  key: grafana-cloud-password
+      volumes:
+        - name: logs-forwarder
+          configMap:
+            name: logs-forwarder
+      serviceAccountName: pod-log-reader

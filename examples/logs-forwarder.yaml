@@ -1,7 +1,7 @@
 input:
   broker_pod_log:
-    namespace: green
-    pod: green-0
+    namespace: ${NAMESPACE}
+    pod: ${POD_PREFIX}-${ORDINAL}
     container: redpanda
     labels:
       image: $.spec.containers[0].image
@@ -18,9 +18,9 @@ output:
       - redpanda.*
       - pod_id
     conf:
-      name: grafanacloud-paulmwilkinson-logs
-      url: https://logs-prod-012.grafana.net/loki/api/v1/push
+      name: ${LOKI_INSTANCE_NAME}
+      url: ${LOKI_URL}
       client:
         basic_auth:
-          username: 997552
-          password: redacted
+          username: ${LOKI_USERNAME}
+          password: ${LOKI_PASSWORD}
