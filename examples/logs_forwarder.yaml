@@ -1,0 +1,26 @@
+input:
+  broker_pod_log:
+    namespace: green
+    pod: green-0
+    container: redpanda
+    labels:
+      image: $.spec.containers[0].image
+      node: $.spec.nodeName
+      pod_id: $.metadata.uid
+      host: $.spec.hostname
+      pod: $.metadata.name
+      namespace: $.metadata.namespace
+      container: $.spec.containers[0].name
+
+output:
+  loki:
+    labels:
+      - redpanda.*
+      - pod_id
+    conf:
+      name: grafanacloud-paulmwilkinson-logs
+      url: https://logs-prod-012.grafana.net/loki/api/v1/push
+      client:
+        basic_auth:
+          username: 997552
+          password: redacted
