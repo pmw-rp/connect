@@ -64,6 +64,7 @@ func BrokerPodMetricsInputConfigFields() []*service.ConfigField {
 			Example([]string{"redpanda"}),
 		service.NewTLSToggledField("tls"),
 		kafka.SASLFields(),
+		service.NewStringField("metrics_endpoint").Optional().Default("/metrics"),
 		service.NewStringMapField("labels").
 			Description("A map of labels to populate from the pod metadata"),
 		service.NewIntField("batchSize").Optional().
@@ -107,12 +108,13 @@ type BrokerMetricsReader struct {
 	eof         bool
 
 	// for redpanda
-	SeedBrokers []string
-	clientID    string
-	TLSConf     *tls.Config
-	saslConfs   []sasl.Mechanism
-	nodeId      string
-	clusterId   string
+	SeedBrokers     []string
+	clientID        string
+	TLSConf         *tls.Config
+	saslConfs       []sasl.Mechanism
+	nodeId          string
+	clusterId       string
+	metricsEndpoint string
 
 	// for label handling
 	showLabelPaths bool
@@ -177,6 +179,11 @@ func NewPodMetricsReaderFromConfig(conf *service.ParsedConfig, res *service.Reso
 	}
 
 	if r.saslConfs, err = kafka.SASLMechanismsFromConfig(conf); err != nil {
+		return nil, err
+	}
+
+	r.metricsEndpoint, err = conf.FieldString("metrics_endpoint")
+	if err != nil {
 		return nil, err
 	}
 
@@ -292,7 +299,11 @@ func (r *BrokerMetricsReader) Connect(ctx context.Context) error {
 		return err
 	}
 
-	r.url = "https://" + host + ":" + adminPort + "/metrics"
+	if r.TLSConf != nil {
+		r.url = "https://" + host + ":" + adminPort + r.metricsEndpoint
+	} else {
+		r.url = "http://" + host + ":" + adminPort + r.metricsEndpoint
+	}
 
 	for name, path := range r.labelPaths {
 		parsedPath, err := jp.ParseString(path)
@@ -417,7 +428,9 @@ func (r *BrokerMetricsReader) getMessages(ctx context.Context) (service.MessageB
 	content := string(bytes)
 	lines := strings.Split(content, "\n")
 	for _, line := range lines {
-		messages = append(messages, service.NewMessage(r.enrichScrape([]byte(line))))
+		message := service.NewMessage(r.enrichScrape([]byte(line)))
+		message.MetaSetMut("timestamp", fmt.Sprintf("%v", time.Now().UnixNano()/1e6))
+		messages = append(messages, message)
 	}
 
 	return messages, nil
