@@ -25,6 +25,7 @@ import (
 	"github.com/ohler55/ojg/jp"
 	"github.com/ohler55/ojg/oj"
 	"github.com/redpanda-data/benthos/v4/public/service"
+	"github.com/redpanda-data/connect/v4/internal/impl/kafka"
 	"github.com/redpanda-data/connect/v4/internal/impl/kubernetes"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -50,14 +51,19 @@ func podLogInputConfig() *service.ConfigSpec {
 func PodLogInputConfigFields() []*service.ConfigField {
 	return []*service.ConfigField{
 		service.NewStringField("namespace").
-			Description("The namespace for the pod").
+			Description("The namespace for the Redpanda pod").
 			Example([]string{"redpanda"}),
-		service.NewStringField("pod").
-			Description("The name of the pod").
+		service.NewStringField("pod_prefix").
+			Description("The prefix of the Redpanda pod").
 			Example([]string{"redpanda-0"}),
+		service.NewStringField("pod_name").
+			Description("The name of this pod").
+			Example([]string{"logs-forwarder-0"}),
 		service.NewStringField("container").
 			Description("The name of the container within the pod").
 			Example([]string{"redpanda"}),
+		service.NewTLSToggledField("tls"),
+		kafka.SASLFields(),
 		service.NewStringMapField("labels").
 			Description("A map of labels to populate from the pod metadata"),
 		service.NewIntField("batchSize").Optional().
@@ -87,7 +93,8 @@ func init() {
 type BrokerLogReader struct {
 	// to address the pod
 	namespace string
-	pod       string
+	podPrefix string
+	podName   string
 	container string
 
 	// to stream data
@@ -149,7 +156,12 @@ func NewBrokerLogReaderFromConfig(conf *service.ParsedConfig, res *service.Resou
 		panic(err)
 	}
 
-	r.pod, err = conf.FieldString("pod")
+	r.podPrefix, err = conf.FieldString("pod_prefix")
+	if err != nil {
+		panic(err)
+	}
+
+	r.podName, err = conf.FieldString("pod_name")
 	if err != nil {
 		panic(err)
 	}
@@ -157,6 +169,17 @@ func NewBrokerLogReaderFromConfig(conf *service.ParsedConfig, res *service.Resou
 	r.container, err = conf.FieldString("container")
 	if err != nil {
 		panic(err)
+	}
+
+	tlsConf, tlsEnabled, err := conf.FieldTLSToggled("tls")
+	if err != nil {
+		return nil, err
+	}
+	if tlsEnabled {
+		r.TLSConf = tlsConf
+	}
+	if r.saslConfs, err = kafka.SASLMechanismsFromConfig(conf); err != nil {
+		return nil, err
 	}
 
 	r.closing = false
@@ -248,6 +271,12 @@ func (r *BrokerLogReader) populateRedpandaMetadata(ctx context.Context) error {
 	return nil
 }
 
+func (r *BrokerLogReader) getPodName() (string, error) {
+	parts := strings.Split(r.podName, "-")
+	ordinal := parts[len(parts)-1]
+	return r.podPrefix + "-" + ordinal, nil
+}
+
 // Connect to the pod logs.
 func (r *BrokerLogReader) Connect(ctx context.Context) error {
 	cs, err := kubernetes.GetClientSet()
@@ -257,7 +286,11 @@ func (r *BrokerLogReader) Connect(ctx context.Context) error {
 		TypeMeta:        metav1.TypeMeta{},
 		ResourceVersion: "",
 	}
-	pod, err := cs.CoreV1().Pods(r.namespace).Get(ctx, r.pod, getOptions)
+	podName, err := r.getPodName()
+	if err != nil {
+		return err
+	}
+	pod, err := cs.CoreV1().Pods(r.namespace).Get(ctx, podName, getOptions)
 	if err != nil {
 		return err
 	}
@@ -291,7 +324,7 @@ func (r *BrokerLogReader) Connect(ctx context.Context) error {
 		return err
 	}
 
-	host := r.pod + "." + instance + "." + r.namespace + ".svc.cluster.local."
+	host := podName + "." + instance + "." + r.namespace + ".svc.cluster.local."
 	r.SeedBrokers = []string{host + ":" + kafkaPort}
 
 	err = r.populateRedpandaMetadata(ctx)
@@ -312,7 +345,7 @@ func (r *BrokerLogReader) Connect(ctx context.Context) error {
 	r.labels["redpanda_id"] = r.clusterId
 
 	podLogOptions := v1.PodLogOptions{
-		Container: r.labels["container"],
+		Container: r.container,
 		Follow:    true,
 		TailLines: &r.count,
 	}
@@ -320,7 +353,7 @@ func (r *BrokerLogReader) Connect(ctx context.Context) error {
 	podLogRequest := cs.
 		CoreV1().
 		Pods(r.namespace).
-		GetLogs(r.pod, &podLogOptions)
+		GetLogs(podName, &podLogOptions)
 	stream, err := podLogRequest.Stream(context.TODO())
 
 	if err != nil {

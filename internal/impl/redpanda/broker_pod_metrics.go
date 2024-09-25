@@ -24,6 +24,7 @@ import (
 	"github.com/ohler55/ojg/jp"
 	"github.com/ohler55/ojg/oj"
 	"github.com/redpanda-data/benthos/v4/public/service"
+	"github.com/redpanda-data/connect/v4/internal/impl/kafka"
 	"github.com/redpanda-data/connect/v4/internal/impl/kubernetes"
 	"github.com/twmb/franz-go/pkg/kadm"
 	"github.com/twmb/franz-go/pkg/kgo"
@@ -50,14 +51,19 @@ func brokerPodMetricsInputConfig() *service.ConfigSpec {
 func BrokerPodMetricsInputConfigFields() []*service.ConfigField {
 	return []*service.ConfigField{
 		service.NewStringField("namespace").
-			Description("The namespace for the pod").
+			Description("The namespace for the Redpanda pod").
 			Example([]string{"redpanda"}),
-		service.NewStringField("pod").
+		service.NewStringField("pod_prefix").
+			Description("The prefix of the Redpanda pod").
+			Example([]string{"redpanda-0"}),
+		service.NewStringField("pod_name").
 			Description("The name of the pod").
 			Example([]string{"redpanda-0"}),
 		service.NewStringField("container").
 			Description("The name of the container within the pod").
 			Example([]string{"redpanda"}),
+		service.NewTLSToggledField("tls"),
+		kafka.SASLFields(),
 		service.NewStringMapField("labels").
 			Description("A map of labels to populate from the pod metadata"),
 		service.NewIntField("batchSize").Optional().
@@ -87,7 +93,8 @@ func init() {
 type BrokerMetricsReader struct {
 	// to address the pod
 	namespace string
-	pod       string
+	podPrefix string
+	podName   string
 	container string
 
 	// to stream data
@@ -146,7 +153,12 @@ func NewPodMetricsReaderFromConfig(conf *service.ParsedConfig, res *service.Reso
 		panic(err)
 	}
 
-	r.pod, err = conf.FieldString("pod")
+	r.podPrefix, err = conf.FieldString("pod_prefix")
+	if err != nil {
+		panic(err)
+	}
+
+	r.podName, err = conf.FieldString("pod_name")
 	if err != nil {
 		panic(err)
 	}
@@ -154,6 +166,18 @@ func NewPodMetricsReaderFromConfig(conf *service.ParsedConfig, res *service.Reso
 	r.container, err = conf.FieldString("container")
 	if err != nil {
 		panic(err)
+	}
+
+	tlsConf, tlsEnabled, err := conf.FieldTLSToggled("tls")
+	if err != nil {
+		return nil, err
+	}
+	if tlsEnabled {
+		r.TLSConf = tlsConf
+	}
+
+	if r.saslConfs, err = kafka.SASLMechanismsFromConfig(conf); err != nil {
+		return nil, err
 	}
 
 	//r.closing = false
@@ -203,8 +227,16 @@ func (r *BrokerMetricsReader) populateRedpandaMetadata(ctx context.Context) erro
 	return nil
 }
 
+func (r *BrokerMetricsReader) getPodName() (string, error) {
+	parts := strings.Split(r.podName, "-")
+	ordinal := parts[len(parts)-1]
+	return r.podPrefix + "-" + ordinal, nil
+}
+
 // Connect to the pod logs.
 func (r *BrokerMetricsReader) Connect(ctx context.Context) error {
+	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+
 	cs, err := kubernetes.GetClientSet()
 	maybePanic(err)
 
@@ -214,7 +246,11 @@ func (r *BrokerMetricsReader) Connect(ctx context.Context) error {
 		TypeMeta:        metav1.TypeMeta{},
 		ResourceVersion: "",
 	}
-	pod, err := cs.CoreV1().Pods(r.namespace).Get(ctx, r.pod, getOptions)
+	podName, err := r.getPodName()
+	if err != nil {
+		return err
+	}
+	pod, err := cs.CoreV1().Pods(r.namespace).Get(ctx, podName, getOptions)
 	if err != nil {
 		return err
 	}
@@ -248,7 +284,7 @@ func (r *BrokerMetricsReader) Connect(ctx context.Context) error {
 		return err
 	}
 
-	host := r.pod + "." + instance + "." + r.namespace + ".svc.cluster.local."
+	host := podName + "." + instance + "." + r.namespace + ".svc.cluster.local."
 	r.SeedBrokers = []string{host + ":" + kafkaPort}
 
 	err = r.populateRedpandaMetadata(ctx)
@@ -256,7 +292,7 @@ func (r *BrokerMetricsReader) Connect(ctx context.Context) error {
 		return err
 	}
 
-	r.url = "http://" + host + ":" + adminPort + "/metrics"
+	r.url = "https://" + host + ":" + adminPort + "/metrics"
 
 	for name, path := range r.labelPaths {
 		parsedPath, err := jp.ParseString(path)
@@ -367,22 +403,49 @@ func (r *BrokerMetricsReader) doMetricsRequest(ctx context.Context) ([]byte, err
 	}
 }
 
-// ReadBatch attempts to read a batch of log messages from the target pod container.
-func (r *BrokerMetricsReader) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
+func (r *BrokerMetricsReader) getMessages(ctx context.Context) (service.MessageBatch, error) {
 	messages := service.MessageBatch{}
 
 	bytes, err := r.doMetricsRequest(ctx)
+	if errors.Is(err, tooSoon) {
+		return messages, nil
+	}
+	if err != nil {
+		return messages, err
+	}
+
+	content := string(bytes)
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		messages = append(messages, service.NewMessage(r.enrichScrape([]byte(line))))
+	}
+
+	return messages, nil
+}
+
+// ReadBatch attempts to read a batch of log messages from the target pod container.
+func (r *BrokerMetricsReader) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
+	//messages := service.MessageBatch{}
+	//
+	//bytes, err := r.doMetricsRequest(ctx)
+	//if errors.Is(err, tooSoon) {
+	//	return messages, func(ctx context.Context, res error) error {
+	//		return nil
+	//	}, nil
+	//}
+	//if err != nil {
+	//	panic(err)
+	//}
+	//
+	//message := service.NewMessage(r.enrichScrape(bytes))
+	//messages = append(messages, message)
+
+	messages, err := r.getMessages(ctx)
 	if errors.Is(err, tooSoon) {
 		return messages, func(ctx context.Context, res error) error {
 			return nil
 		}, nil
 	}
-	if err != nil {
-		panic(err)
-	}
-
-	message := service.NewMessage(r.enrichScrape(bytes))
-	messages = append(messages, message)
 
 	if len(messages) == 0 && r.eof == true {
 		return nil, nil, service.ErrNotConnected
