@@ -33,9 +33,9 @@ func newMimirProcessor() (*mimirProcessor, error) {
 }
 
 func init() {
-	err := service.RegisterProcessor(
+	err := service.RegisterBatchProcessor(
 		"mimir_processor", mimirProcessorConfig(),
-		func(conf *service.ParsedConfig, mgr *service.Resources) (service.Processor, error) {
+		func(conf *service.ParsedConfig, mgr *service.Resources) (service.BatchProcessor, error) {
 			return newMimirProcessorFromConfig(conf, mgr)
 		})
 	if err != nil {
@@ -142,33 +142,37 @@ func encode(line string) string {
 }
 
 // Process ProcessMessage
-func (s *mimirProcessor) Process(ctx context.Context, msg *service.Message) (service.MessageBatch, error) {
+func (s *mimirProcessor) ProcessBatch(ctx context.Context, batch service.MessageBatch) ([]service.MessageBatch, error) {
 
 	metadata := make(map[string]*Datum)
 	metrics := make([]Timeseries, 0)
 
-	bytes, err := msg.AsBytes()
-	if err != nil {
-		return nil, err
-	}
-	scrape := string(bytes)
+	for _, msg := range batch {
 
-	lines := strings.Split(scrape, "\n")
-	for _, line := range lines {
-		if len(line) > 0 {
-			if strings.HasPrefix(line, "# HELP") {
-				processHelp(line, metadata)
-			} else if strings.HasPrefix(line, "# TYPE") {
-				processType(line, metadata)
-			} else if len(line) > 0 {
-				ts, found := msg.MetaGet("timestamp")
-				if !found {
-					ts = fmt.Sprintf("%v", time.Now().UnixNano()/1e6)
+		bytes, err := msg.AsBytes()
+		if err != nil {
+			return nil, err
+		}
+		scrape := string(bytes)
+
+		lines := strings.Split(scrape, "\n")
+		for _, line := range lines {
+			if len(line) > 0 {
+				if strings.HasPrefix(line, "# HELP") {
+					processHelp(line, metadata)
+				} else if strings.HasPrefix(line, "# TYPE") {
+					processType(line, metadata)
+				} else if len(line) > 0 {
+					ts, found := msg.MetaGet("timestamp")
+					if !found {
+						ts = fmt.Sprintf("%v", time.Now().UnixNano()/1e6)
+					}
+					timeseries := processMetric(line, ts)
+					metrics = append(metrics, timeseries)
 				}
-				timeseries := processMetric(line, ts)
-				metrics = append(metrics, timeseries)
 			}
 		}
+
 	}
 
 	meta := make([]Datum, 0)
@@ -182,9 +186,11 @@ func (s *mimirProcessor) Process(ctx context.Context, msg *service.Message) (ser
 	if err != nil {
 		panic(err)
 	}
-	msg.SetBytes(j)
 
-	return []*service.Message{msg}, nil
+	msg := service.NewMessage(j)
+	resultBatch := service.MessageBatch{msg}
+
+	return []service.MessageBatch{resultBatch}, nil
 }
 
 // Close does nothing.
