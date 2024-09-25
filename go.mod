@@ -147,6 +147,7 @@ require (
 )
 
 require (
+	bitbucket.org/bodhisnarkva/cbor v0.0.0-20170201010848-113f42203c94 // indirect
 	cloud.google.com/go/longrunning v0.6.0 // indirect
 	github.com/HdrHistogram/hdrhistogram-go v1.1.2 // indirect
 	github.com/Masterminds/goutils v1.1.1 // indirect
