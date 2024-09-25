@@ -1,0 +1,134 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: logs-ingester
+  labels:
+    app: logs-ingester
+spec:
+  clusterIP: None
+  selector:
+    app: logs-ingester
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: logs-ingester
+  labels:
+    app: logs-ingester
+spec:
+  serviceName: "logs-ingester"
+  selector:
+    matchLabels:
+      app: logs-ingester
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: logs-ingester
+    spec:
+      containers:
+        - name: logs-ingester
+          #          image: docker.redpanda.com/redpandadata/connect:0.0.1
+          image: pmwrp/rp-live:0.0.8
+          command: ["/redpanda-connect", "run", "/config/logs-ingester.yaml"]
+          volumeMounts:
+            - name: logs-ingester
+              mountPath: /config
+            - name: schemas
+              mountPath: /schemas/push.proto
+              subPath: push.proto
+            - name: schemas
+              mountPath: /schemas/gogo.proto
+              subPath: gogo.proto
+            - name: schemas
+              mountPath: /schemas/timestamp.proto
+              subPath: timestamp.proto
+          env:
+            - name: LOKI_INSTANCE_NAME
+              value: "grafanacloud-paulmwilkinson-logs"
+            - name: LOKI_URL
+              value: "https://logs-prod-012.grafana.net/loki/api/v1/push"
+            - name: LOKI_USERNAME
+              value: "997552"
+            - name: LOKI_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-cloud-password
+                  key: grafana-cloud-password
+            - name: REDPANDA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redpanda-password
+                  key: redpanda-password
+      volumes:
+        - name: logs-ingester
+          configMap:
+            name: logs-ingester
+        - name: schemas
+          configMap:
+            name: schemas
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrics-ingester
+  labels:
+    app: metrics-ingester
+spec:
+  clusterIP: None
+  selector:
+    app: metrics-ingester
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: metrics-ingester
+  labels:
+    app: metrics-ingester
+spec:
+  serviceName: "metrics-ingester"
+  selector:
+    matchLabels:
+      app: metrics-ingester
+  replicas: 1
+  template:
+    metadata:
+      labels:
+        app: metrics-ingester
+    spec:
+      containers:
+        - name: metrics-ingester
+          #          image: docker.redpanda.com/redpandadata/connect:0.0.1
+          image: pmwrp/rp-live:0.0.8
+          command: ["/redpanda-connect", "run", "/config/metrics-ingester.yaml"]
+          volumeMounts:
+            - name: metrics-ingester
+              mountPath: /config
+            - name: schemas
+              mountPath: /schemas/mimir.proto
+              subPath: mimir.proto
+            - name: schemas
+              mountPath: /schemas/gogo.proto
+              subPath: gogo.proto
+          env:
+            - name: MIMIR_URL
+              value: "https://prometheus-prod-24-prod-eu-west-2.grafana.net/api/prom/push"
+            - name: MIMIR_USERNAME
+              value: "1796533"
+            - name: MIMIR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: grafana-cloud-password
+                  key: grafana-cloud-password
+            - name: REDPANDA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redpanda-password
+                  key: redpanda-password
+      volumes:
+        - name: metrics-ingester
+          configMap:
+            name: metrics-ingester
+        - name: schemas
+          configMap:
+            name: schemas

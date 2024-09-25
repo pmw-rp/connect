@@ -1,8 +1,39 @@
+http:
+  enabled: true
+  address: 0.0.0.0:4195
+  root_path: /benthos
+  debug_endpoints: true
+
+redpanda:
+  seed_brokers: ["crpac7e9sfrjbm1l60og.any.eu-central-1.mpx.prd.cloud.redpanda.com:9092"]
+  logs_topic: logs-forwarder
+  logs_level: info
+  client_id: benthos
+  rack_id: ""
+  timeout: 10s
+  max_message_bytes: 1MB
+  sasl:
+    - mechanism: SCRAM-SHA-256
+      username: customer-1
+      password: ${REDPANDA_PASSWORD}
+  tls:
+    enabled: true
+
+
 input:
+  label: "logs_forwarder_pod_log_input"
   broker_pod_log:
-    namespace: ${NAMESPACE}
-    pod: ${POD_PREFIX}-${ORDINAL}
+    namespace: ${REDPANDA_NAMESPACE}
+    pod_prefix: ${REDPANDA_POD_PREFIX}
+    pod_name: ${POD_NAME}
     container: redpanda
+    sasl:
+      - mechanism: SCRAM-SHA-256
+        password: admin
+        username: admin
+    tls:
+      enabled: true
+      skip_cert_verify: true
     labels:
       image: $.spec.containers[0].image
       node: $.spec.nodeName
@@ -13,14 +44,24 @@ input:
       container: $.spec.containers[0].name
 
 output:
-  loki:
-    labels:
-      - redpanda.*
-      - pod_id
-    conf:
-      name: ${LOKI_INSTANCE_NAME}
-      url: ${LOKI_URL}
-      client:
-        basic_auth:
-          username: ${LOKI_USERNAME}
-          password: ${LOKI_PASSWORD}
+  label: "logs_forwarder_kafka_output"
+  kafka_franz:
+    seed_brokers: ["crpac7e9sfrjbm1l60og.any.eu-central-1.mpx.prd.cloud.redpanda.com:9092"]
+    topic: logs
+    client_id: rp-connect
+    timeout: 10s
+    max_message_bytes: 1MB
+    compression: lz4
+    metadata:
+      include_patterns:
+        - .*
+    batching:
+      byte_size: 1000000
+      count: 0
+      period: 10s
+    sasl:
+      - mechanism: SCRAM-SHA-256
+        username: customer-1
+        password: ${REDPANDA_PASSWORD}
+    tls:
+      enabled: true

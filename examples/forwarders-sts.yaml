@@ -1,0 +1,120 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: logs-forwarder
+  labels:
+    app: logs-forwarder
+spec:
+  clusterIP: None
+  selector:
+    app: logs-forwarder
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: logs-forwarder
+  labels:
+    app: logs-forwarder
+spec:
+  serviceName: "logs-forwarder"
+  selector:
+    matchLabels:
+      app: logs-forwarder
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: logs-forwarder
+    spec:
+      containers:
+        - name: logs-forwarder
+          #          image: docker.redpanda.com/redpandadata/connect:0.0.1
+          image: pmwrp/rp-live:0.0.8
+          command: ["/redpanda-connect", "run", "/config/logs-forwarder.yaml"]
+          volumeMounts:
+            - name: logs-forwarder
+              mountPath: /config
+          env:
+            - name: REDPANDA_NAMESPACE
+              value: redpanda
+            - name: REDPANDA_POD_PREFIX
+              value: redpanda
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: REDPANDA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redpanda-password
+                  key: redpanda-password
+      volumes:
+        - name: logs-forwarder
+          configMap:
+            name: logs-forwarder
+      serviceAccountName: pod-log-reader
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: metrics-forwarder
+  labels:
+    app: metrics-forwarder
+spec:
+  clusterIP: None
+  selector:
+    app: metrics-forwarder
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: metrics-forwarder
+  labels:
+    app: metrics-forwarder
+spec:
+  serviceName: "metrics-forwarder"
+  selector:
+    matchLabels:
+      app: metrics-forwarder
+  replicas: 3
+  template:
+    metadata:
+      labels:
+        app: metrics-forwarder
+    spec:
+      containers:
+        - name: metrics-forwarder
+          #          image: docker.redpanda.com/redpandadata/connect:0.0.1
+          image: pmwrp/rp-live:0.0.8
+          command: ["/redpanda-connect", "run", "/config/metrics-forwarder.yaml"]
+          volumeMounts:
+            - name: metrics-forwarder
+              mountPath: /config
+            - name: schemas
+              mountPath: /schemas/mimir.proto
+              subPath: mimir.proto
+            - name: schemas
+              mountPath: /schemas/gogo.proto
+              subPath: gogo.proto
+          env:
+            - name: REDPANDA_NAMESPACE
+              value: redpanda
+            - name: REDPANDA_POD_PREFIX
+              value: redpanda
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: REDPANDA_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redpanda-password
+                  key: redpanda-password
+      volumes:
+        - name: metrics-forwarder
+          configMap:
+            name: metrics-forwarder
+        - name: schemas
+          configMap:
+            name: schemas
+      serviceAccountName: pod-log-reader

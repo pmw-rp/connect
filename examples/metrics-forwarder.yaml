@@ -1,8 +1,38 @@
+http:
+  enabled: true
+  address: 0.0.0.0:4195
+  root_path: /benthos
+  debug_endpoints: true
+
+redpanda:
+  seed_brokers: ["crpac7e9sfrjbm1l60og.any.eu-central-1.mpx.prd.cloud.redpanda.com:9092"]
+  logs_topic: metrics-forwarder
+  logs_level: info
+  client_id: benthos
+  rack_id: ""
+  timeout: 10s
+  max_message_bytes: 1MB
+  sasl:
+    - mechanism: SCRAM-SHA-256
+      username: customer-1
+      password: ${REDPANDA_PASSWORD}
+  tls:
+    enabled: true
+
 input:
+  label: "metrics_forwarder_pod_metrics_input"
   broker_pod_metrics:
-    namespace: ${NAMESPACE}
-    pod: ${POD_PREFIX}-${ORDINAL}
+    namespace: ${REDPANDA_NAMESPACE}
+    pod_prefix: ${REDPANDA_POD_PREFIX}
+    pod_name: ${POD_NAME}
     container: redpanda
+    sasl:
+      - mechanism: SCRAM-SHA-256
+        password: admin
+        username: admin
+    tls:
+      enabled: true
+      skip_cert_verify: true
     labels:
       kubernetes_image: $.spec.containers[0].image
       kubernetes_node: $.spec.nodeName
@@ -12,25 +42,25 @@ input:
       kubernetes_namespace: $.metadata.namespace
       kubernetes_container: $.spec.containers[0].name
 
-pipeline:
-  processors:
-    - mimir_processor: {}
-    - protobuf:
-        operator: from_json
-        message: cortexpb.WriteRequest
-        import_paths: [ schemas ]
-    - catch:
-        - mapping: |
-            root = deleted()
-    - compress:
-        algorithm: snappy
-
 output:
-  http_client:
-    url: ${MIMIR_URL}
-    verb: POST
-    timeout: 5s
-    basic_auth:
+  label: "metrics_forwarder_kafka_output"
+  kafka_franz:
+    seed_brokers: ["crpac7e9sfrjbm1l60og.any.eu-central-1.mpx.prd.cloud.redpanda.com:9092"]
+    topic: metrics
+    client_id: rp-connect
+    timeout: 10s
+    max_message_bytes: 1MB
+    compression: lz4
+    metadata:
+      include_patterns:
+        - .*
+    batching:
+      byte_size: 1000000
+      count: 0
+      period: 10s
+    sasl:
+      - mechanism: SCRAM-SHA-256
+        username: customer-1
+        password: ${REDPANDA_PASSWORD}
+    tls:
       enabled: true
-      username: ${MIMIR_USERNAME}
-      password: ${MIMIR_PASSWORD}
