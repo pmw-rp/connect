@@ -21,7 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/Jeffail/shutdown"
-	"github.com/ohler55/ojg/jp"
+	"github.com/expr-lang/expr"
 	"github.com/ohler55/ojg/oj"
 	"github.com/redpanda-data/benthos/v4/public/service"
 	"github.com/redpanda-data/connect/v4/internal/impl/kafka"
@@ -65,13 +65,13 @@ func BrokerPodMetricsInputConfigFields() []*service.ConfigField {
 		service.NewTLSToggledField("tls"),
 		kafka.SASLFields(),
 		service.NewStringField("metrics_endpoint").Optional().Default("/metrics"),
-		service.NewStringMapField("labels").
+		service.NewStringMapField("headers").
 			Description("A map of labels to populate from the pod metadata"),
 		service.NewIntField("batchSize").Optional().
 			Description("The name of the container within the pod").
 			Example([]string{"redpanda"}),
-		service.NewBoolField("show_label_paths").Optional().Default(false).
-			Description("Whether to iterate over all label paths to help during config creation."),
+		//service.NewBoolField("show_label_paths").Optional().Default(false).
+		//	Description("Whether to iterate over all label paths to help during config creation."),
 		service.NewAutoRetryNacksToggleField(),
 	}
 }
@@ -112,14 +112,12 @@ type BrokerMetricsReader struct {
 	clientID        string
 	TLSConf         *tls.Config
 	saslConfs       []sasl.Mechanism
-	nodeId          string
-	clusterId       string
 	metricsEndpoint string
 
 	// for label handling
-	showLabelPaths bool
-	labelPaths     map[string]string
-	labels         map[string]string
+	env               map[string]interface{}
+	headerExpressions map[string]string
+	headers           map[string]string
 
 	// for management
 	res     *service.Resources
@@ -138,14 +136,14 @@ func NewPodMetricsReaderFromConfig(conf *service.ParsedConfig, res *service.Reso
 
 	var err error
 
-	r.labels = make(map[string]string)
+	r.headers = make(map[string]string)
 
-	r.showLabelPaths, err = conf.FieldBool("show_label_paths")
-	if err != nil {
-		panic(err)
-	}
+	//r.showLabelPaths, err = conf.FieldBool("show_label_paths")
+	//if err != nil {
+	//	panic(err)
+	//}
 
-	r.labelPaths, err = conf.FieldStringMap("labels")
+	r.headerExpressions, err = conf.FieldStringMap("headers")
 	if err != nil {
 		panic(err)
 	}
@@ -192,7 +190,7 @@ func NewPodMetricsReaderFromConfig(conf *service.ParsedConfig, res *service.Reso
 	return &r, nil
 }
 
-func (r *BrokerMetricsReader) populateRedpandaMetadata(ctx context.Context) error {
+func (r *BrokerMetricsReader) populateRedpandaMetadata(ctx context.Context) (map[string]interface{}, error) {
 	r.log.Debugf("Connecting to %v", r.SeedBrokers)
 	var cl *kgo.Client
 
@@ -208,7 +206,7 @@ func (r *BrokerMetricsReader) populateRedpandaMetadata(ctx context.Context) erro
 
 	var err error
 	if cl, err = kgo.NewClient(clientOpts...); err != nil {
-		return err
+		return nil, err
 	}
 
 	adm := kadm.NewClient(cl)
@@ -216,22 +214,29 @@ func (r *BrokerMetricsReader) populateRedpandaMetadata(ctx context.Context) erro
 	r.log.Debug("Retrieving Redpanda metadata...")
 	metadata, err := adm.BrokerMetadata(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	r.clusterId = metadata.Cluster
-	r.log.Debugf("Determined Redpanda cluster ID as %v", r.clusterId)
+	clusterId := metadata.Cluster
+	nodeId := ""
+	r.log.Debugf("Determined Redpanda cluster ID as %v", clusterId)
 	for _, broker := range metadata.Brokers {
 		host := fmt.Sprintf(broker.Host+":%v", broker.Port)
 		if host == r.SeedBrokers[0] {
-			r.nodeId = fmt.Sprintf("%v", broker.NodeID)
+			nodeId = fmt.Sprintf("%v", broker.NodeID)
 		}
 	}
 
 	cl.Close()
 	r.log.Debug("Closed connection to Redpanda")
 
-	return nil
+	m := make(map[string]interface{})
+	m["cluster_id"] = clusterId
+	if nodeId != "" {
+		m["node_id"] = nodeId
+	}
+
+	return m, nil
 }
 
 func (r *BrokerMetricsReader) getPodName() (string, error) {
@@ -268,11 +273,11 @@ func (r *BrokerMetricsReader) Connect(ctx context.Context) error {
 		return err
 	}
 
-	if r.showLabelPaths {
-		jp.Walk(obj, func(path jp.Expr, value any) {
-			fmt.Printf("%v: %v\n", path, value)
-		}, true)
-	}
+	//if r.showLabelPaths {
+	//	jp.Walk(obj, func(path jp.Expr, value any) {
+	//		fmt.Printf("%v: %v\n", path, value)
+	//	}, true)
+	//}
 
 	kafkaPort, err := extract("$.spec.containers[?(@.command[0]=='rpk')].ports[?(@.name=='kafka')].containerPort", obj)
 	if err != nil {
@@ -294,7 +299,7 @@ func (r *BrokerMetricsReader) Connect(ctx context.Context) error {
 	host := podName + "." + instance + "." + r.namespace + ".svc.cluster.local."
 	r.SeedBrokers = []string{host + ":" + kafkaPort}
 
-	err = r.populateRedpandaMetadata(ctx)
+	brokerMetadata, err := r.populateRedpandaMetadata(ctx)
 	if err != nil {
 		return err
 	}
@@ -305,17 +310,23 @@ func (r *BrokerMetricsReader) Connect(ctx context.Context) error {
 		r.url = "http://" + host + ":" + adminPort + r.metricsEndpoint
 	}
 
-	for name, path := range r.labelPaths {
-		parsedPath, err := jp.ParseString(path)
+	// Build static headers
+
+	r.env = make(map[string]interface{})
+	r.env["pod"] = obj
+	r.env["broker"] = brokerMetadata
+
+	for k, v := range r.headerExpressions {
+		program, err := expr.Compile(v, expr.Env(r.env))
 		if err != nil {
 			panic(err)
 		}
-		result := parsedPath.Get(obj)
-		r.labels[name] = fmt.Sprint(result[0])
+		output, err := expr.Run(program, r.env)
+		if err != nil {
+			panic(err)
+		}
+		r.headers[k] = fmt.Sprintf("%v", output)
 	}
-
-	r.labels["redpanda_node_id"] = r.nodeId
-	r.labels["redpanda_id"] = r.clusterId
 
 	if err != nil {
 		return err
@@ -333,7 +344,7 @@ func (r *BrokerMetricsReader) enrichLine(line string) string {
 		sb.WriteString(line[:leftBraceIndex])
 		sb.WriteString("{")
 		first := true
-		for k, v := range r.labels {
+		for k, v := range r.headers {
 			if !first {
 				sb.WriteString(",")
 			}
@@ -428,9 +439,11 @@ func (r *BrokerMetricsReader) getMessages(ctx context.Context) (service.MessageB
 	content := string(bytes)
 	lines := strings.Split(content, "\n")
 	for _, line := range lines {
-		message := service.NewMessage(r.enrichScrape([]byte(line)))
-		message.MetaSetMut("timestamp", fmt.Sprintf("%v", time.Now().UnixNano()/1e6))
-		messages = append(messages, message)
+		if len(line) > 0 {
+			message := service.NewMessage(r.enrichScrape([]byte(line)))
+			message.MetaSetMut("timestamp", fmt.Sprintf("%v", time.Now().UnixNano()/1e6))
+			messages = append(messages, message)
+		}
 	}
 
 	return messages, nil
@@ -438,21 +451,6 @@ func (r *BrokerMetricsReader) getMessages(ctx context.Context) (service.MessageB
 
 // ReadBatch attempts to read a batch of log messages from the target pod container.
 func (r *BrokerMetricsReader) ReadBatch(ctx context.Context) (service.MessageBatch, service.AckFunc, error) {
-	//messages := service.MessageBatch{}
-	//
-	//bytes, err := r.doMetricsRequest(ctx)
-	//if errors.Is(err, tooSoon) {
-	//	return messages, func(ctx context.Context, res error) error {
-	//		return nil
-	//	}, nil
-	//}
-	//if err != nil {
-	//	panic(err)
-	//}
-	//
-	//message := service.NewMessage(r.enrichScrape(bytes))
-	//messages = append(messages, message)
-
 	messages, err := r.getMessages(ctx)
 	if errors.Is(err, tooSoon) {
 		return messages, func(ctx context.Context, res error) error {

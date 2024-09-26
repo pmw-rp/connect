@@ -29,7 +29,7 @@ spec:
       containers:
         - name: logs-forwarder
           #          image: docker.redpanda.com/redpandadata/connect:0.0.1
-          image: pmwrp/rp-live:0.0.8
+          image: pmwrp/rp-live:0.0.12
           command: ["/redpanda-connect", "run", "/config/logs-forwarder.yaml"]
           volumeMounts:
             - name: logs-forwarder
@@ -85,7 +85,7 @@ spec:
       containers:
         - name: metrics-forwarder
           #          image: docker.redpanda.com/redpandadata/connect:0.0.1
-          image: pmwrp/rp-live:0.0.8
+          image: pmwrp/rp-live:0.0.12
           command: ["/redpanda-connect", "run", "/config/metrics-forwarder.yaml"]
           volumeMounts:
             - name: metrics-forwarder

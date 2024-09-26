@@ -6,7 +6,7 @@ http:
 
 redpanda:
   seed_brokers: ["crpac7e9sfrjbm1l60og.any.eu-central-1.mpx.prd.cloud.redpanda.com:9092"]
-  logs_topic: metrics-forwarder
+#  logs_topic: metrics-forwarder
   logs_level: info
   client_id: benthos
   rack_id: ""
@@ -33,14 +33,18 @@ input:
     tls:
       enabled: true
       skip_cert_verify: true
-    labels:
-      kubernetes_image: $.spec.containers[0].image
-      kubernetes_node: $.spec.nodeName
-      kubernetes_pod_id: $.metadata.uid
-      kubernetes_host: $.spec.hostname
-      kubernetes_pod: $.metadata.name
-      kubernetes_namespace: $.metadata.namespace
-      kubernetes_container: $.spec.containers[0].name
+    metrics_endpoint: /public_metrics
+    headers:
+      image: pod.spec.containers[0].image
+      pod_id: pod.metadata.uid
+      host: pod.spec.hostname
+      pod_name: pod.metadata.name
+      namespace: pod.metadata.namespace
+      container: pod.spec.containers[0].name
+      redpanda_id: broker.cluster_id
+      redpanda_node_id: broker.node_id
+      redpanda_cloud_data_cluster_name: broker.cluster_id
+      instance: pod.metadata.labels['app.kubernetes.io/instance']
 
 output:
   label: "metrics_forwarder_kafka_output"

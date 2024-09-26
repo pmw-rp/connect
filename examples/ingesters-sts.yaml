@@ -29,7 +29,7 @@ spec:
       containers:
         - name: logs-ingester
           #          image: docker.redpanda.com/redpandadata/connect:0.0.1
-          image: pmwrp/rp-live:0.0.8
+          image: pmwrp/rp-live:0.0.12
           command: ["/redpanda-connect", "run", "/config/logs-ingester.yaml"]
           volumeMounts:
             - name: logs-ingester
@@ -99,7 +99,7 @@ spec:
       containers:
         - name: metrics-ingester
           #          image: docker.redpanda.com/redpandadata/connect:0.0.1
-          image: pmwrp/rp-live:0.0.8
+          image: pmwrp/rp-live:0.0.12
           command: ["/redpanda-connect", "run", "/config/metrics-ingester.yaml"]
           volumeMounts:
             - name: metrics-ingester

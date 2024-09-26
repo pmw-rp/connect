@@ -6,7 +6,7 @@ http:
 
 redpanda:
   seed_brokers: ["crpac7e9sfrjbm1l60og.any.eu-central-1.mpx.prd.cloud.redpanda.com:9092"]
-  logs_topic: metrics-ingester
+#  logs_topic: metrics-ingester
   logs_level: info
   client_id: benthos
   rack_id: ""
@@ -28,9 +28,9 @@ input:
     consumer_group: "foo"
     auto_replay_nacks: true
     batching:
-      count: 1000
+      count: 0
       byte_size: 0
-      period: ""
+      period: 15s
       check: ""
       processors: [ ] # No default (optional)
     sasl:

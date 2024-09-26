@@ -22,6 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"github.com/Jeffail/shutdown"
+	"github.com/expr-lang/expr"
+	"github.com/expr-lang/expr/vm"
 	"github.com/ohler55/ojg/jp"
 	"github.com/ohler55/ojg/oj"
 	"github.com/redpanda-data/benthos/v4/public/service"
@@ -33,6 +35,7 @@ import (
 	"io"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -64,7 +67,8 @@ func PodLogInputConfigFields() []*service.ConfigField {
 			Example([]string{"redpanda"}),
 		service.NewTLSToggledField("tls"),
 		kafka.SASLFields(),
-		service.NewStringMapField("labels").
+		service.NewStringField("extractor").Optional().Default(""),
+		service.NewStringMapField("headers").
 			Description("A map of labels to populate from the pod metadata"),
 		service.NewIntField("batchSize").Optional().
 			Description("The name of the container within the pod").
@@ -114,9 +118,13 @@ type BrokerLogReader struct {
 	clusterId   string
 
 	// for label handling
-	showLabelPaths bool
-	labelPaths     map[string]string
-	labels         map[string]string
+	//showLabelPaths bool
+	extractor               string
+	env                     map[string]interface{}
+	headerExpressions       map[string]string
+	headers                 map[string]string
+	lineExpressions         map[string]string
+	compiledLineExpressions map[string]*vm.Program
 
 	// for management
 	res     *service.Resources
@@ -139,16 +147,27 @@ func NewBrokerLogReaderFromConfig(conf *service.ParsedConfig, res *service.Resou
 		r.batchSize = batchSize
 	}
 	r.lines = make(chan string, r.batchSize)
-	r.labels = make(map[string]string)
+	r.headers = make(map[string]string)
 
-	r.showLabelPaths, err = conf.FieldBool("show_label_paths")
+	r.extractor, err = conf.FieldString("extractor")
 	if err != nil {
 		panic(err)
 	}
 
-	r.labelPaths, err = conf.FieldStringMap("labels")
+	r.headerExpressions = make(map[string]string)
+	r.lineExpressions = make(map[string]string)
+	r.compiledLineExpressions = make(map[string]*vm.Program)
+
+	headers, err := conf.FieldStringMap("headers")
 	if err != nil {
 		panic(err)
+	}
+	for k, v := range headers {
+		if strings.HasPrefix(v, "line.") {
+			r.lineExpressions[k] = v
+		} else {
+			r.headerExpressions[k] = v
+		}
 	}
 
 	r.namespace, err = conf.FieldString("namespace")
@@ -229,7 +248,7 @@ func extract(path string, obj any) (string, error) {
 	}
 }
 
-func (r *BrokerLogReader) populateRedpandaMetadata(ctx context.Context) error {
+func (r *BrokerLogReader) populateRedpandaMetadata(ctx context.Context) (map[string]interface{}, error) {
 	r.log.Debugf("Connecting to %v", r.SeedBrokers)
 	var cl *kgo.Client
 
@@ -245,7 +264,7 @@ func (r *BrokerLogReader) populateRedpandaMetadata(ctx context.Context) error {
 
 	var err error
 	if cl, err = kgo.NewClient(clientOpts...); err != nil {
-		return err
+		return nil, err
 	}
 
 	adm := kadm.NewClient(cl)
@@ -253,28 +272,57 @@ func (r *BrokerLogReader) populateRedpandaMetadata(ctx context.Context) error {
 	r.log.Debug("Retrieving Redpanda metadata...")
 	metadata, err := adm.BrokerMetadata(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	r.clusterId = metadata.Cluster
+	clusterId := metadata.Cluster
+	nodeId := ""
 	r.log.Debugf("Determined Redpanda cluster ID as %v", r.clusterId)
 	for _, broker := range metadata.Brokers {
 		host := fmt.Sprintf(broker.Host+":%v", broker.Port)
 		if host == r.SeedBrokers[0] {
-			r.nodeId = fmt.Sprintf("%v", broker.NodeID)
+			nodeId = fmt.Sprintf("%v", broker.NodeID)
 		}
 	}
 
 	cl.Close()
 	r.log.Debug("Closed connection to Redpanda")
 
-	return nil
+	m := make(map[string]interface{})
+	m["cluster_id"] = clusterId
+	if nodeId != "" {
+		m["node_id"] = nodeId
+	}
+
+	return m, nil
 }
 
 func (r *BrokerLogReader) getPodName() (string, error) {
 	parts := strings.Split(r.podName, "-")
 	ordinal := parts[len(parts)-1]
 	return r.podPrefix + "-" + ordinal, nil
+}
+
+var regexes = make(map[string]*regexp.Regexp)
+
+func extractContents(s string, regex string) (parameters map[string]string) {
+	var err error
+	compiled, ok := regexes[regex]
+	if !ok {
+		compiled, err = regexp.Compile(regex)
+		if err != nil {
+			panic(err)
+		}
+		regexes[regex] = compiled
+	}
+	match := compiled.FindStringSubmatch(s)
+	parameters = make(map[string]string)
+	for i, name := range compiled.SubexpNames() {
+		if i > 0 && i <= len(match) {
+			parameters[name] = match[i]
+		}
+	}
+	return parameters
 }
 
 // Connect to the pod logs.
@@ -301,12 +349,6 @@ func (r *BrokerLogReader) Connect(ctx context.Context) error {
 		return err
 	}
 
-	if r.showLabelPaths {
-		jp.Walk(obj, func(path jp.Expr, value any) {
-			fmt.Printf("%v: %v\n", path, value)
-		}, true)
-	}
-
 	kafkaPort, err := extract("$.spec.containers[?(@.command[0]=='rpk')].ports[?(@.name=='kafka')].containerPort", obj)
 	if err != nil {
 		return err
@@ -327,22 +369,30 @@ func (r *BrokerLogReader) Connect(ctx context.Context) error {
 	host := podName + "." + instance + "." + r.namespace + ".svc.cluster.local."
 	r.SeedBrokers = []string{host + ":" + kafkaPort}
 
-	err = r.populateRedpandaMetadata(ctx)
+	brokerMetadata, err := r.populateRedpandaMetadata(ctx)
 	if err != nil {
 		return err
 	}
 
-	for name, path := range r.labelPaths {
-		parsedPath, err := jp.ParseString(path)
+	// Build static headers
+
+	r.env = make(map[string]interface{})
+	r.env["pod"] = obj
+	r.env["broker"] = brokerMetadata
+
+	for k, v := range r.headerExpressions {
+		program, err := expr.Compile(v, expr.Env(r.env))
 		if err != nil {
 			panic(err)
 		}
-		result := parsedPath.Get(obj)
-		r.labels[name] = fmt.Sprint(result[0])
+		output, err := expr.Run(program, r.env)
+		if err != nil {
+			panic(err)
+		}
+		r.headers[k] = fmt.Sprintf("%v", output)
 	}
 
-	r.labels["redpanda_node_id"] = r.nodeId
-	r.labels["redpanda_id"] = r.clusterId
+	// Connect to logs and stream
 
 	podLogOptions := v1.PodLogOptions{
 		Container: r.container,
@@ -391,7 +441,7 @@ func extractTimestamp(s string, format string) (time.Time, bool) {
 func (r *BrokerLogReader) addMeta(message *service.Message) error {
 
 	// Add static labels found during connection
-	for k, v := range r.labels {
+	for k, v := range r.headers {
 		message.MetaSetMut(k, v)
 	}
 
@@ -400,6 +450,30 @@ func (r *BrokerLogReader) addMeta(message *service.Message) error {
 		return err
 	}
 	line := string(content)
+
+	// If there are line expressions, compute them and add to headers
+
+	if len(r.lineExpressions) > 0 {
+		params := extractContents(line, r.extractor)
+		env := make(map[string]interface{})
+		env["line"] = params
+
+		for k, v := range r.lineExpressions {
+			vm, ok := r.compiledLineExpressions[v]
+			if !ok {
+				vm, err = expr.Compile(v, expr.Env(env))
+				if err != nil {
+					panic(err)
+				}
+				r.compiledLineExpressions[v] = vm
+			}
+			output, err := expr.Run(vm, env)
+			if err != nil {
+				panic(err)
+			}
+			message.MetaSetMut(k, output)
+		}
+	}
 
 	//
 	firstSpace := strings.Index(line, " ")
