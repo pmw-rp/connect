@@ -618,9 +618,12 @@ github.com/containerd/typeurl/v2 v2.2.3 h1:yNA/94zxWdvYACdYO8zofhrTVuQY73fFU1y++
 github.com/containerd/typeurl/v2 v2.2.3/go.mod h1:95ljDnPfD3bAbDJRugOiShd/DlAAsxGtUBhJxIn7SCk=
 github.com/coreos/go-oidc/v3 v3.17.0 h1:hWBGaQfbi0iVviX4ibC7bk8OKT5qNr4klBaCHVNvehc=
 github.com/coreos/go-oidc/v3 v3.17.0/go.mod h1:wqPbKFrVnE90vty060SB40FCJ8fTHTxSwyXJqZH+sI8=
+github.com/coreos/go-semver v0.3.1 h1:yi21YpKnrx1gt5R+la8n5WgS0kCrsPp33dmEyHReZr4=
+github.com/coreos/go-semver v0.3.1/go.mod h1:irMmmIw/7yzSRPWryHsK7EYSg09caPQL03VsM8rvUec=
 github.com/coreos/go-systemd v0.0.0-20190321100706-95778dfbb74e/go.mod h1:F5haX7vjVVG0kc13fIWeqUViNPyEJxv/OmvnBo0Yme4=
 github.com/coreos/go-systemd v0.0.0-20190719114852-fd7a80b32e1f/go.mod h1:F5haX7vjVVG0kc13fIWeqUViNPyEJxv/OmvnBo0Yme4=
 github.com/coreos/go-systemd/v22 v22.3.2/go.mod h1:Y58oyj3AT4RCenI/lSvhwexgC+NSVTIJ3seZv2GcEnc=
+github.com/coreos/go-systemd/v22 v22.5.0 h1:RrqgGjYQKalulkV8NGVIfkXQf6YYmOyiJKk8iXXhfZs=
 github.com/coreos/go-systemd/v22 v22.5.0/go.mod h1:Y58oyj3AT4RCenI/lSvhwexgC+NSVTIJ3seZv2GcEnc=
 github.com/couchbase/gocb/v2 v2.12.1 h1:jfWeFMB0HWYqpKzujOCY7eSMP8EHlUMtEMVRn4El8/k=
 github.com/couchbase/gocb/v2 v2.12.1/go.mod h1:HhPsEJC1TYiqFcngEsM5J1s35VYlfHVixJ6U+t/oicY=
@@ -1869,6 +1872,12 @@ go.einride.tech/aip v0.79.0/go.mod h1:E8+wdTApA70odnpFzJgsGogHozC2JCIhFJBKPr8bVi
 go.etcd.io/bbolt v1.3.6/go.mod h1:qXsaaIqmgQH0T+OPdb99Bf+PKfBBQVAdyD6TY9G8XM4=
 go.etcd.io/bbolt v1.3.11 h1:yGEzV1wPz2yVCLsD8ZAiGHhHVlczyC9d1rP43/VCRJ0=
 go.etcd.io/bbolt v1.3.11/go.mod h1:dksAq7YMXoljX0xu6VF5DMZGbhYYoLUalEiSySYAS4I=
+go.etcd.io/etcd/api/v3 v3.6.10 h1:jlwjtELjA8yi2VWpOFH+0w0lGr3K6mVDyn0RDB9aaAY=
+go.etcd.io/etcd/api/v3 v3.6.10/go.mod h1:pdV4VeFmvhdNjB4LWRkC8ReLyRBAxUOze3GarMhE2sk=
+go.etcd.io/etcd/client/pkg/v3 v3.6.10 h1:tBT7podcPhuVbCVkAEzx8bC5I+aqxfLwBN8/As1arrA=
+go.etcd.io/etcd/client/pkg/v3 v3.6.10/go.mod h1:WEy3PpwbbEBVRdh1NVJYsuUe/8eyI21PNJRazeD8z/Y=
+go.etcd.io/etcd/client/v3 v3.6.10 h1:J598zJ+C/ZPvImypmq5waj84+bovePrlZERHklf34y0=
+go.etcd.io/etcd/client/v3 v3.6.10/go.mod h1:iHhUDUcEwaKs1YFq3MgmI9U4zhTVasp/vgdVbFf1RS8=
 go.mongodb.org/mongo-driver v1.11.4/go.mod h1:PTSz5yu21bkT/wXpkS7WR5f0ddqw5quethTUn9WM+2g=
 go.mongodb.org/mongo-driver/v2 v2.5.0 h1:yXUhImUjjAInNcpTcAlPHiT7bIXhshCTL3jVBkF3xaE=
 go.mongodb.org/mongo-driver/v2 v2.5.0/go.mod h1:yOI9kBsufol30iFsl1slpdq1I0eHPzybRWdyYUs8K/0=

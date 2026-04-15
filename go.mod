@@ -183,6 +183,7 @@ require (
 	github.com/xitongsys/parquet-go v1.6.2
 	github.com/xitongsys/parquet-go-source v0.0.0-20241021075129-b732d2ac9c9b
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78
+	go.etcd.io/etcd/client/v3 v3.6.10
 	go.mongodb.org/mongo-driver/v2 v2.5.0
 	go.nanomsg.org/mangos/v3 v3.4.2
 	go.opentelemetry.io/collector/pdata v1.54.0
@@ -249,6 +250,8 @@ require (
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/platforms v1.0.0-rc.4 // indirect
 	github.com/coreos/go-oidc/v3 v3.17.0 // indirect
+	github.com/coreos/go-semver v0.3.1 // indirect
+	github.com/coreos/go-systemd/v22 v22.5.0 // indirect
 	github.com/creasty/defaults v1.8.0 // indirect
 	github.com/cyphar/filepath-securejoin v0.6.1 // indirect
 	github.com/dnephin/pflag v1.0.7 // indirect
@@ -331,6 +334,8 @@ require (
 	gitlab.com/golang-commonmark/linkify v0.0.0-20200225224916-64bca66f6ad3 // indirect
 	gitlab.com/golang-commonmark/mdurl v0.0.0-20191124015652-932350d1cb84 // indirect
 	gitlab.com/golang-commonmark/puny v0.0.0-20191124015043-9f83538fa04f // indirect
+	go.etcd.io/etcd/api/v3 v3.6.10 // indirect
+	go.etcd.io/etcd/client/pkg/v3 v3.6.10 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/collector/featuregate v1.54.0 // indirect
 	go.opentelemetry.io/contrib/detectors/gcp v1.42.0 // indirect
