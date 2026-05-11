@@ -549,11 +549,24 @@ func (i *mysqlStreamInput) readSnapshot(ctx context.Context, snapshot *Snapshot)
 	wg, wgCtx := errgroup.WithContext(ctx)
 	for _, tx := range snapshot.workerTxs {
 		tx := tx
+		// Each worker gets its own batcher so message construction and batching
+		// happens in parallel rather than serialising through readMessages.
+		batcher, err := i.batching.NewBatcher(i.res)
+		if err != nil {
+			return fmt.Errorf("creating snapshot batcher: %w", err)
+		}
 		wg.Go(func() error {
+			defer batcher.Close(wgCtx)
 			for unit := range unitQueue {
-				if err := i.snapshotTable(wgCtx, snapshot, tx, unit.table, unit.bounds); err != nil {
+				if err := i.snapshotTable(wgCtx, snapshot, tx, unit.table, unit.bounds, batcher); err != nil {
 					return err
 				}
+			}
+			// Flush any partial batch remaining after this worker's last chunk.
+			if batch, err := batcher.Flush(wgCtx); err != nil {
+				return fmt.Errorf("flushing final snapshot batch: %w", err)
+			} else if err := i.flushSnapshotBatch(wgCtx, batch); err != nil {
+				return fmt.Errorf("sending final snapshot batch: %w", err)
 			}
 			return nil
 		})
@@ -561,7 +574,7 @@ func (i *mysqlStreamInput) readSnapshot(ctx context.Context, snapshot *Snapshot)
 	return wg.Wait()
 }
 
-func (i *mysqlStreamInput) snapshotTable(ctx context.Context, snapshot *Snapshot, tx *sql.Tx, table string, bounds *chunkBounds) error {
+func (i *mysqlStreamInput) snapshotTable(ctx context.Context, snapshot *Snapshot, tx *sql.Tx, table string, bounds *chunkBounds, batcher *service.Batcher) error {
 	if bounds != nil {
 		i.logger.Infof("Starting snapshot chunk of table '%s' [lo=%v, hi=%v)", table, bounds.lowerIncl, bounds.upperExcl)
 	} else {
@@ -575,6 +588,8 @@ func (i *mysqlStreamInput) snapshotTable(ctx context.Context, snapshot *Snapshot
 	} else {
 		i.logger.Warnf("Failed to fetch schema for table %s during snapshot: %v", table, err)
 	}
+
+	tableSchema := i.getOrExtractTableSchemaByName(table)
 
 	tablePks, err := snapshot.getTablePrimaryKeys(ctx, tx, table)
 	if err != nil {
@@ -634,16 +649,22 @@ func (i *mysqlStreamInput) snapshotTable(ctx context.Context, snapshot *Snapshot
 				}
 			}
 
-			select {
-			case i.rawMessageEvents <- MessageEvent{
-				Row:       row,
-				Operation: MessageOperationRead,
-				Table:     table,
-				Position:  nil,
-			}:
-			case <-ctx.Done():
-				_ = batchRows.Close()
-				return ctx.Err()
+			mb := service.NewMessage(nil)
+			mb.SetStructuredMut(row)
+			mb.MetaSet("operation", string(MessageOperationRead))
+			mb.MetaSet("table", table)
+			if tableSchema != nil {
+				mb.MetaSetImmut("schema", service.ImmutableAny{V: tableSchema})
+			}
+
+			if batcher.Add(mb) {
+				if batch, err := batcher.Flush(ctx); err != nil {
+					_ = batchRows.Close()
+					return fmt.Errorf("flushing snapshot batch: %w", err)
+				} else if err := i.flushSnapshotBatch(ctx, batch); err != nil {
+					_ = batchRows.Close()
+					return fmt.Errorf("sending snapshot batch: %w", err)
+				}
 			}
 		}
 
@@ -888,6 +909,35 @@ func (i *mysqlStreamInput) readMessages(ctx context.Context) error {
 				}
 			}
 		}
+	}
+}
+
+// flushSnapshotBatch sends a snapshot batch directly to msgChan, bypassing
+// readMessages. Snapshot batches carry no binlog position; their checkpoint
+// is resolved by the snapshotComplete event after all workers finish.
+func (i *mysqlStreamInput) flushSnapshotBatch(ctx context.Context, batch service.MessageBatch) error {
+	if len(batch) == 0 {
+		return nil
+	}
+	resolveFn, err := i.cp.Track(ctx, nil, int64(len(batch)))
+	if err != nil {
+		return fmt.Errorf("tracking checkpoint for snapshot batch: %w", err)
+	}
+	msg := asyncMessage{
+		msg: batch,
+		ackFn: func(ctx context.Context, _ error) error {
+			i.checkpointMu.Lock()
+			defer i.checkpointMu.Unlock()
+			// nil position — nothing to persist until snapshotComplete resolves.
+			_ = resolveFn()
+			return nil
+		},
+	}
+	select {
+	case i.msgChan <- msg:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
