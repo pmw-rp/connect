@@ -230,7 +230,7 @@ func newMySQLStreamInput(conf *service.ParsedConfig, res *service.Resources) (s 
 	i := mysqlStreamInput{
 		logger:           res.Logger(),
 		rawMessageEvents: make(chan MessageEvent, 8192),
-		msgChan:          make(chan asyncMessage),
+		msgChan:          make(chan asyncMessage, 8),
 		res:              res,
 		tableSchemas:     make(map[string]any),
 	}
