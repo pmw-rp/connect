@@ -46,8 +46,13 @@ type LogMiner struct {
 	currentSCN   uint64
 	windowSize   int
 	sessionMgr   *SessionManager
-	db           *sql.DB
-	dmlParser    *sqlredo.Parser
+
+	// state for the log_count windowing strategy (see miningCycleLogCount)
+	logCount            int
+	previousCappedFiles []*LogFile
+	maxRedoLogBytes     int64
+	db                  *sql.DB
+	dmlParser           *sqlredo.Parser
 
 	// Pre-built query string for LogMiner contents
 	logMinerQuery string
@@ -133,6 +138,7 @@ func NewMiner(db *sql.DB, userTables []replication.UserTable, publisher replicat
 		lobStates:        make(map[sqlredo.TransactionID]*sqlredo.TxnLOBState),
 		pendingLOBWrites: make(map[sqlredo.TransactionID][]*sqlredo.RedoEvent),
 		windowSize:       cfg.SCNWindowSize,
+		logCount:         cfg.LogCountMin,
 	}
 	if lm.txnCache == nil {
 		lm.txnCache = NewInMemoryCache(cfg.MaxTransactionEvents, metrics, logger)
@@ -211,7 +217,18 @@ func (lm *LogMiner) FindStartPos(ctx context.Context) (replication.SCN, error) {
 	return replication.SCN(currentPos), nil
 }
 
+// miningCycle runs a single mining iteration using the configured windowing strategy.
 func (lm *LogMiner) miningCycle(ctx context.Context, conn *sql.Conn) (caughtUp bool, err error) {
+	if lm.cfg.WindowingStrategy == WindowingStrategyLogCount {
+		return lm.miningCycleLogCount(ctx, conn)
+	}
+	return lm.miningCycleSCNRange(ctx, conn)
+}
+
+// miningCycleSCNRange is the legacy windowing strategy: the mining session's upper bound is an
+// SCN offset (windowSize) from the current position, adapted up/down between min/max bounds
+// based on whether the connector is caught up or has a backlog to work through.
+func (lm *LogMiner) miningCycleSCNRange(ctx context.Context, conn *sql.Conn) (caughtUp bool, err error) {
 	// Get database's current SCN to know our target
 	var dbCurrentSCN uint64
 	if err := conn.QueryRowContext(ctx, "SELECT CURRENT_SCN FROM V$DATABASE").Scan(&dbCurrentSCN); err != nil {
@@ -233,50 +250,193 @@ func (lm *LogMiner) miningCycle(ctx context.Context, conn *sql.Conn) (caughtUp b
 		hitCap = true
 	}
 
-	// Restart the session on every cycle with explicit SCN bounds. Oracle's START_LOGMNR
-	// with ENDSCN=0 freezes the session's view at session start time, making events written
-	// after session start invisible. Per-window restart with explicit endSCN ensures all
-	// events in [currentSCN, endSCN] are visible.
-	if err := lm.prepareLogsAndStartSession(ctx, conn, lm.currentSCN, endSCN); err != nil {
+	logFiles, err := lm.logCollector.GetLogsBySCNRange(ctx, conn, lm.currentSCN, endSCN)
+	if err != nil {
+		return false, fmt.Errorf("collecting redo logs for logminer: %w", err)
+	}
+
+	tuningHint := fmt.Sprintf(
+		"   - Reduce logminer.scn_window_size (current: %d SCN units) to process smaller windows per cycle\n"+
+			"   - Decrease logminer.backoff_interval (current: %v)",
+		lm.cfg.SCNWindowSize, lm.cfg.MiningBackoffInterval)
+
+	retry, resumeSCN, err := lm.runMiningWindow(ctx, conn, logFiles, lm.currentSCN, endSCN, tuningHint)
+	if err != nil {
+		return false, err
+	}
+	if retry {
+		// resumeSCN reflects whatever was actually processed (and, for commits, published)
+		// before the retry condition hit — advance to it so the next cycle doesn't re-mine
+		// and re-publish work already done. See runMiningWindow's doc comment.
+		if resumeSCN > lm.currentSCN {
+			lm.currentSCN = resumeSCN
+		}
+		return false, nil
+	}
+
+	lm.windowSize = adaptWindowSize(lm.windowSize, hitCap, lm.cfg.MinSCNWindowSize, lm.cfg.MaxSCNWindowSize, lm.cfg.SCNWindowSize)
+	lm.currentSCN = endSCN
+	return endSCN >= dbCurrentSCN, nil
+}
+
+// miningCycleLogCount is the log_count windowing strategy, modeled on Debezium 3.6's approach:
+// instead of computing the mining session's upper bound from an adaptive SCN range, it selects a
+// minimum number of redo/archive logs (logCount) starting at the current position and derives the
+// upper bound directly from the logs selected. When every selected log is the current online log
+// (i.e. there's no backlog of completed archive logs to work through), no cap is applied and the
+// session mines all the way up to the database's current SCN. If the selected log set doesn't
+// change between cycles — meaning a long-running transaction spans more logs than the configured
+// minimum — the count grows by one log to make progress toward that transaction's commit; once the
+// log set advances again, the count resets back to the configured minimum.
+func (lm *LogMiner) miningCycleLogCount(ctx context.Context, conn *sql.Conn) (caughtUp bool, err error) {
+	var dbCurrentSCN uint64
+	if err := conn.QueryRowContext(ctx, "SELECT CURRENT_SCN FROM V$DATABASE").Scan(&dbCurrentSCN); err != nil {
+		return false, fmt.Errorf("fetching current SCN: %w", err)
+	}
+
+	if lm.currentSCN >= dbCurrentSCN {
+		return true, nil
+	}
+
+	if lm.cfg.LogCountMin > 0 && lm.maxRedoLogBytes == 0 {
+		maxBytes, err := lm.logCollector.GetMaxOnlineRedoLogBytes(ctx, conn)
+		if err != nil {
+			return false, fmt.Errorf("determining maximum online redo log size: %w", err)
+		}
+		lm.maxRedoLogBytes = maxBytes
+	}
+
+	logs, err := lm.logCollector.GetLogsFromSCN(ctx, conn, lm.currentSCN)
+	if err != nil {
+		return false, fmt.Errorf("collecting redo logs from SCN %d: %w", lm.currentSCN, err)
+	}
+	if len(logs) == 0 {
+		// No logs cover the current position yet (e.g. a log switch is in progress); back off.
+		return true, nil
+	}
+
+	capped, allOnline := capLogsByCount(logs, lm.logCount, lm.maxRedoLogBytes)
+	if lm.cfg.LogCountMin > 0 && lm.previousCappedFiles != nil {
+		if sameLogFiles(capped, lm.previousCappedFiles) {
+			lm.logCount++
+			lm.log.Debugf("Capped log set unchanged since last cycle, growing log count to %d to make progress on a long-running transaction.", lm.logCount)
+			capped, allOnline = capLogsByCount(logs, lm.logCount, lm.maxRedoLogBytes)
+		} else if lm.logCount > lm.cfg.LogCountMin {
+			lm.logCount = lm.cfg.LogCountMin
+			lm.log.Debugf("Capped log set advanced, resetting log count to %d.", lm.logCount)
+			capped, allOnline = capLogsByCount(logs, lm.logCount, lm.maxRedoLogBytes)
+		}
+	}
+	lm.previousCappedFiles = capped
+
+	endSCN := effectiveUpperBound(capped, allOnline, dbCurrentSCN)
+
+	tuningHint := fmt.Sprintf(
+		"   - Decrease logminer.log_count_min (current: %d) to process fewer logs per cycle\n"+
+			"   - Decrease logminer.backoff_interval (current: %v)",
+		lm.cfg.LogCountMin, lm.cfg.MiningBackoffInterval)
+
+	retry, resumeSCN, err := lm.runMiningWindow(ctx, conn, capped, lm.currentSCN, endSCN, tuningHint)
+	if err != nil {
+		return false, err
+	}
+	if retry {
+		// resumeSCN reflects whatever was actually processed (and, for commits, published)
+		// before the retry condition hit — advance to it so the next cycle doesn't re-mine
+		// and re-publish work already done. See runMiningWindow's doc comment.
+		if resumeSCN > lm.currentSCN {
+			lm.currentSCN = resumeSCN
+		}
+		return false, nil
+	}
+
+	if allOnline {
+		// dbCurrentSCN was read before ADD_LOGFILE/START_LOGMNR/the content query ran. If the
+		// online log we mined switched out somewhere in that round-trip, dbCurrentSCN may
+		// already reflect commits written to a *different*, newer online log we never loaded —
+		// LogMiner doesn't error in that case, it just silently returns fewer rows than the
+		// ENDSCN implies. Trusting dbCurrentSCN as endSCN and advancing currentSCN to it would
+		// then permanently skip whatever landed in that newer log before our next cycle notices
+		// it. Re-check the log we actually mined: if it's still the live one, everything up to
+		// dbCurrentSCN is guaranteed covered (CURRENT_SCN can't outrun the log currently
+		// receiving writes); if it switched out, fall back to its own now-fixed coverage.
+		stillCurrent, sealedNextSCN, err := lm.logCollector.CheckLogStillCurrent(ctx, conn, capped[len(capped)-1])
+		if err != nil {
+			return false, err
+		}
+		if !stillCurrent && sealedNextSCN > lm.currentSCN && sealedNextSCN-1 < endSCN {
+			endSCN = sealedNextSCN - 1
+		}
+	}
+
+	lm.currentSCN = endSCN
+	return endSCN >= dbCurrentSCN, nil
+}
+
+// runMiningWindow starts (or extends) a LogMiner session over logFiles bounded by
+// [startSCN, endSCN], then queries and processes V$LOGMNR_CONTENTS for that same range.
+// Restarting the session on every cycle with explicit SCN bounds is required because Oracle's
+// START_LOGMNR with ENDSCN=0 freezes the session's view at session start time, making events
+// written after session start invisible; per-window restart with explicit endSCN ensures all
+// events in [startSCN, endSCN] are visible.
+//
+// retry reports whether the caller should retry rather than treat this as a fatal error — a
+// redo log being recycled mid-window is a recoverable, expected condition under fast log
+// switching. resumeSCN is only meaningful when retry is true: it is the SCN of the last event
+// that was actually handed to processRedoEvent before the retry condition hit, which the caller
+// MUST advance to (never re-mine from the original startSCN unchanged) if it's past startSCN.
+//
+// This distinction matters because processRedoEvent's COMMIT case has a real, irreversible side
+// effect — publishing events downstream. If the query got partway through [startSCN, endSCN],
+// published some commits, and only then hit ORA-01368, blindly retrying the original startSCN
+// would re-mine and re-publish everything already published. Worse, under sustained load each
+// such retry's endSCN is computed fresh (a growing dbCurrentSCN or wider log selection), so a
+// naive "same startSCN, bigger window" retry compounds: it takes longer, giving the live log
+// more time to switch again mid-query, triggering another retry with an even bigger window — a
+// self-reinforcing loop that was observed in practice to redeliver the same events 2x+ under a
+// sustained ~20 MiB/s write rate. Resuming from resumeSCN keeps every retry attempt bounded to
+// only the unprocessed remainder.
+func (lm *LogMiner) runMiningWindow(ctx context.Context, conn *sql.Conn, logFiles []*LogFile, startSCN, endSCN uint64, tuningHint string) (retry bool, resumeSCN uint64, err error) {
+	if err := lm.startSessionWithLogFiles(ctx, conn, startSCN, endSCN, logFiles); err != nil {
 		var oraErr *goora.OracleError
 		if errors.As(err, &oraErr) && oraErr.ErrCode == errCodeMissingLogFile {
 			//nolint:staticcheck
-			return false, fmt.Errorf("preparing logs and starting session at position %d: %w\n\n"+
+			return false, 0, fmt.Errorf("preparing logs and starting session at position %d: %w\n\n"+
 				"This error indicates archived redo logs have been purged before LogMiner could process them.\n"+
 				"This typically happens when processing takes longer than Oracle's log retention period.\n\n"+
 				"To fix this issue:\n"+
 				"1. Increase Oracle's archived log retention using RMAN:\n"+
 				"   CONFIGURE RETENTION POLICY TO RECOVERY WINDOW OF 7 DAYS;\n\n"+
 				"2. Improve processing performance:\n"+
-				"   - Reduce logminer.scn_window_size (current: %d SCN units) to process smaller windows per cycle\n"+
-				"   - Decrease logminer.backoff_interval (current: %v)\n"+
+				"%s\n"+
 				"   - Increase input batching.count for better throughput\n"+
 				"   - Use faster output (e.g., drop: {} for benchmarking)\n\n"+
 				"3. Restart the connector from the current database SCN to skip missing logs:\n"+
 				"   Note: This will result in data loss for events in the purged logs, so a snapshot may be required.",
-				lm.currentSCN, err, lm.cfg.SCNWindowSize, lm.cfg.MiningBackoffInterval)
+				startSCN, err, tuningHint)
 		}
 		if errors.As(err, &oraErr) && oraErr.ErrCode == errCodeRedoLogHeaderMismatch {
-			lm.log.Debugf("ORA-01368: redo log sequence recycled before session could start (SCN range %d–%d); the log will be available as an archived log on next cycle", lm.currentSCN, endSCN)
-			return false, nil
+			lm.log.Debugf("ORA-01368: redo log sequence recycled before session could start (SCN range %d–%d); the log will be available as an archived log on next cycle", startSCN, endSCN)
+			// No rows were read yet — nothing was published, so the original startSCN is
+			// still exactly the right resume point.
+			return true, startSCN, nil
 		}
-		return false, fmt.Errorf("preparing logs and starting session at position %d: %w", lm.currentSCN, err)
+		return false, 0, fmt.Errorf("preparing logs and starting session at position %d: %w", startSCN, err)
 	}
 
 	// Query and process redoEvents from V$LOGMNR_CONTENTS
 	// The session is already active, just query it
-	if err := lm.queryLogMinerContents(ctx, conn, lm.currentSCN, endSCN, lm.processRedoEvent); err != nil {
+	lastSCN, err := lm.queryLogMinerContents(ctx, conn, startSCN, endSCN, lm.processRedoEvent)
+	if err != nil {
 		var oraErr *goora.OracleError
 		if errors.As(err, &oraErr) && oraErr.ErrCode == errCodeRedoLogHeaderMismatch {
-			lm.log.Debugf("ORA-01368: redo log sequence recycled mid-query (SCN range %d–%d); retrying — archived log will be used on next cycle", lm.currentSCN, endSCN)
-			return false, nil
+			lm.log.Debugf("ORA-01368: redo log sequence recycled mid-query (SCN range %d–%d); retrying from SCN %d — archived log will be used on next cycle", startSCN, endSCN, lastSCN)
+			return true, lastSCN, nil
 		}
-		return false, fmt.Errorf("querying logminer contents between %d and %d: %w", lm.currentSCN, endSCN, err)
+		return false, 0, fmt.Errorf("querying logminer contents between %d and %d: %w", startSCN, endSCN, err)
 	}
 
-	lm.windowSize = adaptWindowSize(lm.windowSize, hitCap, lm.cfg.MinSCNWindowSize, lm.cfg.MaxSCNWindowSize, lm.cfg.SCNWindowSize)
-	lm.currentSCN = endSCN
-	return endSCN >= dbCurrentSCN, nil
+	return false, 0, nil
 }
 
 // processRedoEvent buffers emitted events until a commit or rollback event is processed at which
@@ -907,22 +1067,41 @@ func (lm *LogMiner) inferLOBLocator(ctx context.Context, event *sqlredo.RedoEven
 	return false
 }
 
-func (lm *LogMiner) queryLogMinerContents(ctx context.Context, conn *sql.Conn, startSCN, endSCN uint64, processEvent func(context.Context, *sqlredo.RedoEvent) error) error {
+// queryLogMinerContents queries and processes V$LOGMNR_CONTENTS for [startSCN, endSCN]. It always
+// returns lastSCN — a safe resume point — even when err is non-nil, defaulting to startSCN if
+// nothing was processed. The caller uses this on a retryable error: since processEvent's COMMIT
+// case publishes downstream with real side effects, re-querying from startSCN after partial
+// progress would re-publish already published events, whereas re-querying from lastSCN (via the
+// query's "SCN > :1" exclusive lower bound) skips only what was already handled.
+//
+// lastSCN only ever advances to an SCN once every row at that SCN has been seen — V$LOGMNR_CONTENTS
+// commonly has multiple rows sharing one SCN (several row changes within the same redo boundary),
+// and rows are returned in SCN order, so seeing a strictly larger SCN is what confirms the previous
+// one is exhausted. Advancing eagerly to the SCN of whichever row was processed right before a
+// mid-query error would risk a retry's "SCN > lastSCN" query skipping unprocessed siblings still at
+// that exact SCN — silent, permanent loss rather than the harmless occasional re-publish this
+// function is willing to accept instead.
+func (lm *LogMiner) queryLogMinerContents(ctx context.Context, conn *sql.Conn, startSCN, endSCN uint64, processEvent func(context.Context, *sqlredo.RedoEvent) error) (lastSCN uint64, err error) {
+	lastSCN = startSCN
 	if len(lm.tables) == 0 {
-		return nil
+		return lastSCN, nil
 	}
 
 	// Use the pre-built query from initialization
 	queryStart := time.Now()
 	rows, err := conn.QueryContext(ctx, lm.logMinerQuery, startSCN, endSCN)
 	if err != nil {
-		return fmt.Errorf("querying logminer: %w", err)
+		return lastSCN, fmt.Errorf("querying logminer: %w", err)
 	}
 	defer rows.Close()
 
 	var (
 		pending  *sqlredo.RedoEvent // accumulates CSF continuation fragments
 		firstRow = true
+		// lastProcessedSCN is the SCN of the most recently fully-processed event; it is only
+		// promoted to lastSCN once a strictly larger SCN is observed (see doc comment above).
+		lastProcessedSCN  uint64
+		haveLastProcessed bool
 	)
 	for rows.Next() {
 		if firstRow {
@@ -948,7 +1127,11 @@ func (lm *LogMiner) queryLogMinerContents(ctx context.Context, conn *sql.Conn, s
 			&commitSCN,
 			&csf,
 		); err != nil {
-			return err
+			return lastSCN, err
+		}
+
+		if haveLastProcessed && event.SCN > lastProcessedSCN {
+			lastSCN = lastProcessedSCN
 		}
 
 		// CSF (Continuation SQL Flag): Oracle splits long SQL across multiple rows.
@@ -962,8 +1145,9 @@ func (lm *LogMiner) queryLogMinerContents(ctx context.Context, conn *sql.Conn, s
 			if csf == 0 {
 				// Final fragment — emit the accumulated event.
 				if err := processEvent(ctx, pending); err != nil {
-					return fmt.Errorf("processing redo event: %w", err)
+					return lastSCN, fmt.Errorf("processing redo event: %w", err)
 				}
+				lastProcessedSCN, haveLastProcessed = pending.SCN, true
 				pending = nil
 			}
 			// If csf == 1, continue accumulating.
@@ -977,12 +1161,13 @@ func (lm *LogMiner) queryLogMinerContents(ctx context.Context, conn *sql.Conn, s
 		}
 
 		if err := processEvent(ctx, event); err != nil {
-			return fmt.Errorf("processing redo event: %w", err)
+			return lastSCN, fmt.Errorf("processing redo event: %w", err)
 		}
+		lastProcessedSCN, haveLastProcessed = event.SCN, true
 	}
 
 	if err := rows.Err(); err != nil {
-		return err
+		return lastSCN, err
 	}
 
 	// capture timings if 0 rows
@@ -996,11 +1181,18 @@ func (lm *LogMiner) queryLogMinerContents(ctx context.Context, conn *sql.Conn, s
 	if pending != nil {
 		lm.log.Warnf("Incomplete CSF SQL sequence at end of result set (scn=%d, op=%s, txn=%s)", pending.SCN, pending.Operation, pending.TransactionID)
 		if err := processEvent(ctx, pending); err != nil {
-			return fmt.Errorf("processing redo event: %w", err)
+			return lastSCN, fmt.Errorf("processing redo event: %w", err)
 		}
+		lastProcessedSCN, haveLastProcessed = pending.SCN, true
 	}
 
-	return nil
+	// The result set is exhausted — nothing more could share lastProcessedSCN, so it's now
+	// confirmed complete too.
+	if haveLastProcessed {
+		lastSCN = lastProcessedSCN
+	}
+
+	return lastSCN, nil
 }
 
 // LogFile represents a redo or archive log file
@@ -1012,6 +1204,7 @@ type LogFile struct {
 	Type      string // "ONLINE" or "ARCHIVED"
 	IsCurrent bool
 	Thread    int
+	Bytes     int64
 }
 
 // LogFileCollector finds relevant log files to mine
@@ -1092,6 +1285,182 @@ func (*LogFileCollector) GetLogsBySCNRange(ctx context.Context, conn *sql.Conn, 
 	return deduplicateLogs(archived, online), nil
 }
 
+// GetMaxOnlineRedoLogBytes returns the size, in bytes, of the largest configured online redo
+// log group. Used to translate a "number of logs" cap into an approximate byte-size threshold
+// for the log_count windowing strategy, since archived logs can vary slightly in size (e.g.
+// after a redo log resize) while online redo log groups are typically uniform.
+func (*LogFileCollector) GetMaxOnlineRedoLogBytes(ctx context.Context, conn *sql.Conn) (int64, error) {
+	var maxBytes int64
+	if err := conn.QueryRowContext(ctx, "SELECT MAX(BYTES) FROM V$LOG").Scan(&maxBytes); err != nil {
+		return 0, fmt.Errorf("querying maximum online redo log size: %w", err)
+	}
+	if maxBytes <= 0 {
+		return 0, errors.New("database returned an invalid maximum online redo log size (V$LOG.BYTES)")
+	}
+	return maxBytes, nil
+}
+
+// GetLogsFromSCN collects all log files, online and archived, from startSCN forward with no
+// upper bound, ordered by sequence ascending. Used by the log_count windowing strategy, which
+// derives its own upper bound from however many of these logs it selects to mine (see
+// capLogsByCount), rather than from a pre-computed SCN range.
+func (*LogFileCollector) GetLogsFromSCN(ctx context.Context, conn *sql.Conn, startSCN uint64) ([]*LogFile, error) {
+	query := `
+		SELECT FILE_NAME, FIRST_CHANGE, NEXT_CHANGE, SEQ, TYPE, THREAD, BYTES, LOG_STATUS
+		FROM (
+
+			-- Online redo logs at or after startSCN. This can include inactive/active groups
+			-- that have already switched out but aren't yet archived, alongside the log that's
+			-- truly current — LOG_STATUS distinguishes them, since only the latter is safe to
+			-- treat as having no fixed upper bound.
+			SELECT
+				MIN(F.MEMBER) AS FILE_NAME,
+				L.FIRST_CHANGE# FIRST_CHANGE,
+				L.NEXT_CHANGE# NEXT_CHANGE,
+				L.SEQUENCE# AS SEQ,
+				'ONLINE' AS TYPE,
+				L.THREAD# AS THREAD,
+				L.BYTES AS BYTES,
+				L.STATUS AS LOG_STATUS
+			FROM V$LOGFILE F, V$LOG L
+			WHERE (L.STATUS = 'CURRENT' OR L.NEXT_CHANGE# >= :1)
+			AND F.GROUP# = L.GROUP#
+			GROUP BY L.FIRST_CHANGE#, L.NEXT_CHANGE#, L.SEQUENCE#, L.THREAD#, L.BYTES, L.STATUS
+
+			UNION
+
+			-- Archive logs at or after startSCN
+			SELECT
+				A.NAME AS FILE_NAME,
+				A.FIRST_CHANGE# FIRST_CHANGE,
+				A.NEXT_CHANGE# NEXT_CHANGE,
+				A.SEQUENCE# AS SEQ,
+				'ARCHIVED' AS TYPE,
+				A.THREAD# AS THREAD,
+				A.BLOCKS * A.BLOCK_SIZE AS BYTES,
+				'ARCHIVED' AS LOG_STATUS
+			FROM V$ARCHIVED_LOG A
+			WHERE A.NAME IS NOT NULL
+			AND A.ARCHIVED = 'YES'
+			AND A.STATUS = 'A'
+			AND A.NEXT_CHANGE# >= :1
+			AND A.DEST_ID IN (
+				SELECT DEST_ID
+				FROM V$ARCHIVE_DEST_STATUS
+				WHERE STATUS='VALID' AND TYPE='LOCAL' AND ROWNUM=1
+			)
+		)
+		ORDER BY SEQ`
+
+	rows, err := conn.QueryContext(ctx, query, startSCN)
+	if err != nil {
+		return nil, fmt.Errorf("querying logs from SCN %d: %w", startSCN, err)
+	}
+	defer rows.Close()
+
+	var archived, online []*LogFile
+	for rows.Next() {
+		lf := &LogFile{}
+		var logStatus string
+		if err := rows.Scan(&lf.FileName, &lf.FirstSCN, &lf.NextSCN, &lf.Sequence, &lf.Type, &lf.Thread, &lf.Bytes, &logStatus); err != nil {
+			return nil, fmt.Errorf("scanning logs row: %w", err)
+		}
+		lf.IsCurrent = logStatus == "CURRENT"
+		if lf.Type == "ONLINE" {
+			online = append(online, lf)
+		} else {
+			archived = append(archived, lf)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return deduplicateLogs(archived, online), nil
+}
+
+// CheckLogStillCurrent reports whether the online redo log identified by (thread, sequence) is
+// still the database's live current log. When it has switched out since being selected for mining,
+// sealedNextSCN is its now-fixed NEXT_CHANGE# — the exact upper bound of what that log actually
+// contains, safe to use in place of a since-read dbCurrentSCN that may already reflect a different,
+// newer online log this mining cycle never loaded.
+func (*LogFileCollector) CheckLogStillCurrent(ctx context.Context, conn *sql.Conn, log *LogFile) (stillCurrent bool, sealedNextSCN uint64, err error) {
+	var status string
+	if err := conn.QueryRowContext(ctx, `
+		SELECT STATUS, NEXT_CHANGE# FROM V$LOG WHERE THREAD# = :1 AND SEQUENCE# = :2`,
+		log.Thread, log.Sequence).Scan(&status, &sealedNextSCN); err != nil {
+		return false, 0, fmt.Errorf("checking whether log thread=%d seq=%d is still current: %w", log.Thread, log.Sequence, err)
+	}
+	return status == "CURRENT", sealedNextSCN, nil
+}
+
+// capLogsByCount selects a prefix of logs (sorted ascending by sequence) whose cumulative size
+// reaches count*maxLogBytes, mirroring Debezium 3.6's CappedLogFileSessionSelector. It returns
+// allOnline=true when the selection reaches the end of logs without truncation and that last log
+// is the current online redo log — meaning there's no backlog of completed logs to bound against,
+// so the caller should mine without an upper cap instead.
+func capLogsByCount(logs []*LogFile, count int, maxLogBytes int64) (capped []*LogFile, allOnline bool) {
+	if len(logs) == 0 {
+		return nil, false
+	}
+	if count <= 0 {
+		// A non-positive count disables the cap entirely: mine every available log.
+		return logs, logs[len(logs)-1].IsCurrent
+	}
+
+	threshold := int64(count) * maxLogBytes
+
+	var accumulated int64
+	for i, lf := range logs {
+		accumulated += lf.Bytes
+		if accumulated >= threshold || i == len(logs)-1 {
+			capped = logs[:i+1]
+			break
+		}
+	}
+
+	return capped, capped[len(capped)-1].IsCurrent
+}
+
+// effectiveUpperBound computes the mining session's inclusive upper SCN boundary from a capped
+// log selection. When the selection reaches the truly current log (allOnline), there's no fixed
+// upper bound to respect: mine all the way to dbCurrentSCN. Otherwise the session is bounded by
+// the capped set's own coverage.
+//
+// capped[last].NextSCN marks where that coverage ends, but that boundary value itself belongs to
+// the *next* (unloaded) file, not this one: Oracle redo/archive logs use a half-open interval — a
+// file's own content is [FirstSCN, NextSCN), and NextSCN is exactly the next file's FirstSCN.
+// queryLogMinerContents treats its upper bound as inclusive (SCN <= endSCN), so capping to
+// NextSCN itself would ask LogMiner for a row that only physically exists in a file that was
+// never loaded — silently dropping any row whose SCN lands exactly on that boundary. Subtracting
+// one keeps the bound within what's actually loaded. If that leaves no forward progress at all
+// (an edge case: the capped set's own width is a single SCN unit), the caller's "unchanged, grow
+// the count" logic naturally picks up more files on the next cycle rather than looping forever on
+// a zero-width window.
+func effectiveUpperBound(capped []*LogFile, allOnline bool, dbCurrentSCN uint64) uint64 {
+	if allOnline {
+		return dbCurrentSCN
+	}
+	if last := capped[len(capped)-1].NextSCN - 1; last < dbCurrentSCN {
+		return last
+	}
+	return dbCurrentSCN
+}
+
+// sameLogFiles reports whether a and b select the identical set of logs (by thread+sequence),
+// in the same order. Used to detect whether the mining session made forward progress between
+// consecutive log_count cycles.
+func sameLogFiles(a, b []*LogFile) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Thread != b[i].Thread || a[i].Sequence != b[i].Sequence {
+			return false
+		}
+	}
+	return true
+}
+
 // deduplicateLogs merges archive and online log lists, preferring the archive
 // copy when the same (thread, sequence) exists in both (archived logs guarantee
 // completeness where as online logs are still being written to). This prevents
@@ -1118,15 +1487,10 @@ func deduplicateLogs(archived, online []*LogFile) []*LogFile {
 	return out
 }
 
-// prepareLogsAndStartSession collects redo/archive logs for the given SCN range and
-// starts (or restarts) a LogMiner session with explicit SCN bounds. Files are only reloaded
-// (via ADD_LOGFILE) when the required set of logs that contain SCN range changes - so the session is kept
-// open across consecutive windows that cover the same log files.
-func (lm *LogMiner) prepareLogsAndStartSession(ctx context.Context, conn *sql.Conn, startSCN, endSCN uint64) error {
-	logFiles, err := lm.logCollector.GetLogsBySCNRange(ctx, conn, startSCN, endSCN)
-	if err != nil {
-		return fmt.Errorf("collecting redo logs for logminer: %w", err)
-	}
+// startSessionWithLogFiles starts (or restarts) a LogMiner session over logFiles with explicit
+// SCN bounds. Files are only reloaded (via ADD_LOGFILE) when the required set of logs changes -
+// so the session is kept open across consecutive windows that cover the same log files.
+func (lm *LogMiner) startSessionWithLogFiles(ctx context.Context, conn *sql.Conn, startSCN, endSCN uint64, logFiles []*LogFile) error {
 	types := make([]string, len(logFiles))
 	for i, f := range logFiles {
 		types[i] = f.Type

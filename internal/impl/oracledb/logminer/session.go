@@ -48,14 +48,19 @@ func NewSessionManager(cfg *Config, logger *service.Logger) *SessionManager {
 	}
 }
 
-// logFilesChanged performance a filename check on whether newFiles differs from the currently loaded log files.
-// If they're considered the same ADD_LOGFILE can be skipped.
+// logFilesChanged reports whether newFiles differs from the currently loaded log files, identifying
+// each log by (thread, sequence) rather than file name. Online redo log files are a fixed set of
+// physical paths that Oracle reuses across sequence numbers after a log switch, so a file-name
+// comparison would wrongly report "unchanged" when the current online log has rotated to a new
+// sequence but happens to reuse a path already loaded — leaving the LogMiner session mining a stale
+// registration of that file and silently missing records written after the switch. Matches the
+// (thread, sequence) identity already used by sameLogFiles for the analogous log_count comparison.
 func (sm *SessionManager) logFilesChanged(newFiles []*LogFile) bool {
 	if len(sm.loadedFiles) != len(newFiles) {
 		return true
 	}
 	for i, f := range sm.loadedFiles {
-		if f.FileName != newFiles[i].FileName {
+		if f.Thread != newFiles[i].Thread || f.Sequence != newFiles[i].Sequence {
 			return true
 		}
 	}

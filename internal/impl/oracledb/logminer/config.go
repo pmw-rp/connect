@@ -27,6 +27,14 @@ var (
 	DefaultMiningInterval = 300 * time.Millisecond
 	// DefaultMiningStrategy determines LogMiner's default mining strategy.
 	DefaultMiningStrategy = "online_catalog"
+	// DefaultWindowingStrategy determines how the mining session's SCN window/upper bound is
+	// computed each cycle. Defaults to the legacy adaptive SCN-range strategy for backwards
+	// compatibility; log_count is a prototype alternative modeled on Debezium 3.6's approach
+	// of sizing mining sessions by a minimum number of redo logs rather than an SCN range.
+	DefaultWindowingStrategy = WindowingStrategySCNRange
+	// DefaultLogCountMin is the minimum number of redo/archive logs mined per cycle when
+	// WindowingStrategy is log_count. Only takes effect under that strategy.
+	DefaultLogCountMin = 2
 	// DefaultMaxTransactionEvents controls the maximu number of events that can be buffered
 	// per transaction before they're discarded.
 	// Used to prevent large events resulting in memory exhaustion.
@@ -46,6 +54,19 @@ const (
 	OnlineCatalogStrategy MiningStrategy = "online_catalog"
 )
 
+// WindowingStrategy determines how the LogMiner mining session's SCN window is computed each cycle.
+type WindowingStrategy string
+
+const (
+	// WindowingStrategySCNRange is the legacy strategy: an adaptive SCN-range window that grows/shrinks
+	// between min_scn_window_size/max_scn_window_size steps based on whether the connector caught up.
+	WindowingStrategySCNRange WindowingStrategy = "scn_range"
+	// WindowingStrategyLogCount sizes each mining session by a minimum number of redo/archive logs
+	// (log_count_min) rather than an SCN range, growing the count only when a long-running transaction
+	// spans more logs than the minimum. Modeled on Debezium 3.6's log-count based LogMiner windowing.
+	WindowingStrategyLogCount WindowingStrategy = "log_count"
+)
+
 // TransactionCacheConfig contains config specific to service.Cache implementations (ie cache_resources)
 type TransactionCacheConfig struct {
 	CacheName string
@@ -58,6 +79,8 @@ type Config struct {
 	SCNWindowSize          int
 	MinSCNWindowSize       int
 	MaxSCNWindowSize       int
+	WindowingStrategy      WindowingStrategy
+	LogCountMin            int
 	MiningBackoffInterval  time.Duration
 	MiningInterval         time.Duration
 	MiningStrategy         MiningStrategy
@@ -73,6 +96,8 @@ func NewDefaultConfig() *Config {
 		SCNWindowSize:         DefaultSCNWindowSize,
 		MinSCNWindowSize:      DefaultMinSCNWindowSize,
 		MaxSCNWindowSize:      DefaultMaxSCNWindowSize,
+		WindowingStrategy:     DefaultWindowingStrategy,
+		LogCountMin:           DefaultLogCountMin,
 		MiningBackoffInterval: DefaultMiningBackoffInterval,
 		MiningInterval:        DefaultMiningInterval,
 		MiningStrategy:        MiningStrategy(DefaultMiningStrategy),

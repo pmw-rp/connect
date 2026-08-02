@@ -55,6 +55,8 @@ const (
 	ociFieldSCNWindowSize        = "scn_window_size"
 	ociFieldMinSCNWindowSize     = "min_scn_window_size"
 	ociFieldMaxSCNWindowSize     = "max_scn_window_size"
+	ociFieldWindowingStrategy    = "windowing_strategy"
+	ociFieldLogCountMin          = "log_count_min"
 	ociFieldBackoffInterval      = "backoff_interval"
 	ociFieldMiningInterval       = "mining_interval"
 	ociFieldMiningStrategy       = "strategy"
@@ -148,6 +150,16 @@ When using the default Oracle based cache, the Connect user requires permission 
 		service.NewIntField(ociFieldMaxSCNWindowSize).
 			Description(`The maximum SCN range that can be mined in a single cycle. The window starts at `+ociFieldSCNWindowSize+` and grows by `+ociFieldSCNWindowSize+` each cycle that ends at the cap (backlog present), up to this limit. It shrinks by the same step each cycle that catches up to the database. This allows the connector to automatically mine larger windows during heavy backlog and smaller windows during steady state.`).
 			Default(logminer.DefaultMaxSCNWindowSize),
+		service.NewStringEnumField(ociFieldWindowingStrategy,
+			string(logminer.WindowingStrategySCNRange),
+			string(logminer.WindowingStrategyLogCount)).
+			Description("Controls how the mining session's SCN upper bound is computed each cycle. `scn_range` (default) uses the adaptive `"+ociFieldSCNWindowSize+"`/`"+ociFieldMinSCNWindowSize+"`/`"+ociFieldMaxSCNWindowSize+"` window described above. `log_count` (experimental/prototype) instead sizes each session by a minimum number of redo/archive logs (`"+ociFieldLogCountMin+"`), growing only when a long-running transaction spans more logs than the minimum, and mines with no cap at all once caught up to the current online redo log. This mirrors the approach Debezium 3.6 adopted to remove manual LogMiner batch/sleep tuning. When set to `log_count`, `"+ociFieldSCNWindowSize+"`, `"+ociFieldMinSCNWindowSize+"`, and `"+ociFieldMaxSCNWindowSize+"` are ignored.").
+			ShortDescription("How the mining session's SCN upper bound is computed: adaptive SCN range (default) or a Debezium-3.6-style log count.").
+			Default(string(logminer.DefaultWindowingStrategy)),
+		service.NewIntField(ociFieldLogCountMin).
+			Description("The minimum number of redo/archive logs to mine per cycle. Only takes effect when `"+ociFieldWindowingStrategy+"` is `log_count`. Setting this to 0 disables the cap entirely, mining every available log from the current position up to the database's current SCN in a single pass.").
+			ShortDescription("Minimum number of redo/archive logs mined per cycle under the log_count windowing strategy.").
+			Default(logminer.DefaultLogCountMin),
 		service.NewDurationField(ociFieldBackoffInterval).
 			Description("The interval between attempts to check for new changes once all data is processed. For low traffic tables increasing this value can reduce network traffic to the server.").
 			ShortDescription("Interval between checks for new changes once all data is processed.").
@@ -814,6 +826,17 @@ func parseLogMinerConfig(conf *service.ParsedConfig) (*logminer.Config, error) {
 		}
 		if cfg.MaxSCNWindowSize < cfg.SCNWindowSize {
 			return nil, fmt.Errorf("logminer.%s (%d) must be greater than or equal to logminer.%s (%d)", ociFieldMaxSCNWindowSize, cfg.MaxSCNWindowSize, ociFieldSCNWindowSize, cfg.SCNWindowSize)
+		}
+		if strategy, err := lmConf.FieldString(ociFieldWindowingStrategy); err != nil {
+			return nil, err
+		} else {
+			cfg.WindowingStrategy = logminer.WindowingStrategy(strategy)
+		}
+		if cfg.LogCountMin, err = lmConf.FieldInt(ociFieldLogCountMin); err != nil {
+			return nil, err
+		}
+		if cfg.LogCountMin < 0 {
+			return nil, fmt.Errorf("logminer.%s must be 0 or greater, got %d", ociFieldLogCountMin, cfg.LogCountMin)
 		}
 		if cfg.MiningBackoffInterval, err = lmConf.FieldDuration(ociFieldBackoffInterval); err != nil {
 			return nil, err

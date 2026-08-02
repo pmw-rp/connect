@@ -49,6 +49,8 @@ input:
       scn_window_size: 20000
       min_scn_window_size: 1000
       max_scn_window_size: 100000
+      windowing_strategy: scn_range
+      log_count_min: 2
       backoff_interval: 5s
       mining_interval: 300ms
       strategy: online_catalog
@@ -92,6 +94,8 @@ input:
       scn_window_size: 20000
       min_scn_window_size: 1000
       max_scn_window_size: 100000
+      windowing_strategy: scn_range
+      log_count_min: 2
       backoff_interval: 5s
       mining_interval: 300ms
       strategy: online_catalog
@@ -252,6 +256,29 @@ The maximum SCN range that can be mined in a single cycle. The window starts at 
 *Type*: `int`
 
 *Default*: `100000`
+
+=== `logminer.windowing_strategy`
+
+Controls how the mining session's SCN upper bound is computed each cycle. `scn_range` (default) uses the adaptive `scn_window_size`/`min_scn_window_size`/`max_scn_window_size` window described above. `log_count` (experimental/prototype) instead sizes each session by a minimum number of redo/archive logs (`log_count_min`), growing only when a long-running transaction spans more logs than the minimum, and mines with no cap at all once caught up to the current online redo log. This mirrors the approach Debezium 3.6 adopted to remove manual LogMiner batch/sleep tuning. When set to `log_count`, `scn_window_size`, `min_scn_window_size`, and `max_scn_window_size` are ignored.
+
+
+*Type*: `string`
+
+*Default*: `"scn_range"`
+
+Options:
+`scn_range`
+, `log_count`
+.
+
+=== `logminer.log_count_min`
+
+The minimum number of redo/archive logs to mine per cycle. Only takes effect when `windowing_strategy` is `log_count`. Setting this to 0 disables the cap entirely, mining every available log from the current position up to the database's current SCN in a single pass.
+
+
+*Type*: `int`
+
+*Default*: `2`
 
 === `logminer.backoff_interval`
 

@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/redpanda-data/benthos/v4/public/service"
+	"github.com/redpanda-data/connect/v4/internal/impl/oracledb/logminer"
 )
 
 func TestBuildConnectionURL(t *testing.T) {
@@ -223,6 +224,68 @@ logminer: {}
 			got, err := parseSnapshotMode(conf)
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestParseLogMinerConfigWindowingStrategy(t *testing.T) {
+	const minimalOracleCDCYAML = `connection_string: oracle://user:pass@host:1521/svc
+include:
+  - SCHEMA.TABLE
+`
+	tests := []struct {
+		name            string
+		yaml            string
+		wantStrategy    logminer.WindowingStrategy
+		wantLogCountMin int
+		wantErrContains string
+	}{
+		{
+			name:            "defaults to scn_range with legacy log_count_min default",
+			yaml:            minimalOracleCDCYAML + "logminer: {}\n",
+			wantStrategy:    logminer.WindowingStrategySCNRange,
+			wantLogCountMin: logminer.DefaultLogCountMin,
+		},
+		{
+			name: "explicit log_count strategy with custom minimum",
+			yaml: minimalOracleCDCYAML + `logminer:
+  windowing_strategy: log_count
+  log_count_min: 5
+`,
+			wantStrategy:    logminer.WindowingStrategyLogCount,
+			wantLogCountMin: 5,
+		},
+		{
+			name: "log_count_min of zero is accepted (disables the cap)",
+			yaml: minimalOracleCDCYAML + `logminer:
+  windowing_strategy: log_count
+  log_count_min: 0
+`,
+			wantStrategy:    logminer.WindowingStrategyLogCount,
+			wantLogCountMin: 0,
+		},
+		{
+			name: "negative log_count_min is rejected",
+			yaml: minimalOracleCDCYAML + `logminer:
+  log_count_min: -1
+`,
+			wantErrContains: "log_count_min must be 0 or greater",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			conf, err := oracleDBStreamConfigSpec.ParseYAML(tt.yaml, nil)
+			require.NoError(t, err)
+			got, err := parseLogMinerConfig(conf)
+			if tt.wantErrContains != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrContains)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantStrategy, got.WindowingStrategy)
+			assert.Equal(t, tt.wantLogCountMin, got.LogCountMin)
 		})
 	}
 }

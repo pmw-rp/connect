@@ -49,15 +49,28 @@ const (
 	sustainedPoolSize      = sustainedPoolChunkSize * sustainedPoolChunks
 )
 
-// TestSustainedLoad measures whether the connector's throughput and per-event latency stay
-// bounded under a long, steady, realistic change rate, rather than the short backlog-catchup
-// bursts other benchmarks in this package measure. Lag that grows or spikes under sustained load
-// is exactly the failure mode manual LogMiner batch/sleep tuning is prone to.
-func TestSustainedLoad(t *testing.T) {
-	runSustainedLoadBenchmark(t, "sustained", `
+// TestSustainedLoadSCNRange and TestSustainedLoadLogCount are deliberately separate top-level
+// tests, run as isolated `go test -run` processes for the same reason documented on the
+// burst-catchup benchmarks: oracledb_cdc's Close() doesn't guarantee its LogMiner goroutine has
+// exited before returning, so running both strategies in one process risks a leaked goroutine
+// from the first contaminating the second.
+//
+// Unlike the burst-catchup benchmarks (which fire a fixed backlog as fast as possible and measure
+// time-to-drain), these generate a paced, sustained stream of changes for several minutes and
+// track per-message commit-to-delivery latency throughout. This is closer to the question the
+// Debezium blog post was actually asking: under continuous realistic load, does lag stay bounded
+// and consistent, or does it grow/spike as logs accumulate and need re-mining?
+func TestSustainedLoadSCNRange(t *testing.T) {
+	runSustainedLoadBenchmark(t, "scn_range_sustained", `
     scn_window_size: 20000
     min_scn_window_size: 1000
     max_scn_window_size: 100000`)
+}
+
+func TestSustainedLoadLogCount(t *testing.T) {
+	runSustainedLoadBenchmark(t, "log_count_sustained", `
+    windowing_strategy: log_count
+    log_count_min: 2`)
 }
 
 func runSustainedLoadBenchmark(t *testing.T, strategyName, logminerCfg string) {
