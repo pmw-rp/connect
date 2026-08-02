@@ -258,6 +258,8 @@ func (lm *LogMiner) miningCycle(ctx context.Context, conn *sql.Conn) (caughtUp b
 		}
 		if errors.As(err, &oraErr) && oraErr.ErrCode == errCodeRedoLogHeaderMismatch {
 			lm.log.Debugf("ORA-01368: redo log sequence recycled before session could start (SCN range %d–%d); the log will be available as an archived log on next cycle", lm.currentSCN, endSCN)
+			// No rows were read yet — nothing was published, so the original currentSCN is
+			// still exactly the right resume point.
 			return false, nil
 		}
 		return false, fmt.Errorf("preparing logs and starting session at position %d: %w", lm.currentSCN, err)
@@ -265,10 +267,17 @@ func (lm *LogMiner) miningCycle(ctx context.Context, conn *sql.Conn) (caughtUp b
 
 	// Query and process redoEvents from V$LOGMNR_CONTENTS
 	// The session is already active, just query it
-	if err := lm.queryLogMinerContents(ctx, conn, lm.currentSCN, endSCN, lm.processRedoEvent); err != nil {
+	lastSCN, err := lm.queryLogMinerContents(ctx, conn, lm.currentSCN, endSCN, lm.processRedoEvent)
+	if err != nil {
 		var oraErr *goora.OracleError
 		if errors.As(err, &oraErr) && oraErr.ErrCode == errCodeRedoLogHeaderMismatch {
-			lm.log.Debugf("ORA-01368: redo log sequence recycled mid-query (SCN range %d–%d); retrying — archived log will be used on next cycle", lm.currentSCN, endSCN)
+			lm.log.Debugf("ORA-01368: redo log sequence recycled mid-query (SCN range %d–%d); retrying from SCN %d — archived log will be used on next cycle", lm.currentSCN, endSCN, lastSCN)
+			// lastSCN reflects whatever was actually processed (and, for commits, published)
+			// before this error hit — advance to it so the next cycle doesn't re-mine and
+			// re-publish work already done. See queryLogMinerContents' doc comment.
+			if lastSCN > lm.currentSCN {
+				lm.currentSCN = lastSCN
+			}
 			return false, nil
 		}
 		return false, fmt.Errorf("querying logminer contents between %d and %d: %w", lm.currentSCN, endSCN, err)
@@ -907,22 +916,41 @@ func (lm *LogMiner) inferLOBLocator(ctx context.Context, event *sqlredo.RedoEven
 	return false
 }
 
-func (lm *LogMiner) queryLogMinerContents(ctx context.Context, conn *sql.Conn, startSCN, endSCN uint64, processEvent func(context.Context, *sqlredo.RedoEvent) error) error {
+// queryLogMinerContents queries and processes V$LOGMNR_CONTENTS for [startSCN, endSCN]. It always
+// returns lastSCN — a safe resume point — even when err is non-nil, defaulting to startSCN if
+// nothing was processed. The caller uses this on a retryable error: since processEvent's COMMIT
+// case publishes downstream with real side effects, re-querying from startSCN after partial
+// progress would re-publish already published events, whereas re-querying from lastSCN (via the
+// query's "SCN > :1" exclusive lower bound) skips only what was already handled.
+//
+// lastSCN only ever advances to an SCN once every row at that SCN has been seen — V$LOGMNR_CONTENTS
+// commonly has multiple rows sharing one SCN (several row changes within the same redo boundary),
+// and rows are returned in SCN order, so seeing a strictly larger SCN is what confirms the previous
+// one is exhausted. Advancing eagerly to the SCN of whichever row was processed right before a
+// mid-query error would risk a retry's "SCN > lastSCN" query skipping unprocessed siblings still at
+// that exact SCN — silent, permanent loss rather than the harmless occasional re-publish this
+// function is willing to accept instead.
+func (lm *LogMiner) queryLogMinerContents(ctx context.Context, conn *sql.Conn, startSCN, endSCN uint64, processEvent func(context.Context, *sqlredo.RedoEvent) error) (lastSCN uint64, err error) {
+	lastSCN = startSCN
 	if len(lm.tables) == 0 {
-		return nil
+		return lastSCN, nil
 	}
 
 	// Use the pre-built query from initialization
 	queryStart := time.Now()
 	rows, err := conn.QueryContext(ctx, lm.logMinerQuery, startSCN, endSCN)
 	if err != nil {
-		return fmt.Errorf("querying logminer: %w", err)
+		return lastSCN, fmt.Errorf("querying logminer: %w", err)
 	}
 	defer rows.Close()
 
 	var (
 		pending  *sqlredo.RedoEvent // accumulates CSF continuation fragments
 		firstRow = true
+		// lastProcessedSCN is the SCN of the most recently fully-processed event; it is only
+		// promoted to lastSCN once a strictly larger SCN is observed (see doc comment above).
+		lastProcessedSCN  uint64
+		haveLastProcessed bool
 	)
 	for rows.Next() {
 		if firstRow {
@@ -948,7 +976,11 @@ func (lm *LogMiner) queryLogMinerContents(ctx context.Context, conn *sql.Conn, s
 			&commitSCN,
 			&csf,
 		); err != nil {
-			return err
+			return lastSCN, err
+		}
+
+		if haveLastProcessed && event.SCN > lastProcessedSCN {
+			lastSCN = lastProcessedSCN
 		}
 
 		// CSF (Continuation SQL Flag): Oracle splits long SQL across multiple rows.
@@ -962,8 +994,9 @@ func (lm *LogMiner) queryLogMinerContents(ctx context.Context, conn *sql.Conn, s
 			if csf == 0 {
 				// Final fragment — emit the accumulated event.
 				if err := processEvent(ctx, pending); err != nil {
-					return fmt.Errorf("processing redo event: %w", err)
+					return lastSCN, fmt.Errorf("processing redo event: %w", err)
 				}
+				lastProcessedSCN, haveLastProcessed = pending.SCN, true
 				pending = nil
 			}
 			// If csf == 1, continue accumulating.
@@ -977,12 +1010,13 @@ func (lm *LogMiner) queryLogMinerContents(ctx context.Context, conn *sql.Conn, s
 		}
 
 		if err := processEvent(ctx, event); err != nil {
-			return fmt.Errorf("processing redo event: %w", err)
+			return lastSCN, fmt.Errorf("processing redo event: %w", err)
 		}
+		lastProcessedSCN, haveLastProcessed = event.SCN, true
 	}
 
 	if err := rows.Err(); err != nil {
-		return err
+		return lastSCN, err
 	}
 
 	// capture timings if 0 rows
@@ -996,11 +1030,18 @@ func (lm *LogMiner) queryLogMinerContents(ctx context.Context, conn *sql.Conn, s
 	if pending != nil {
 		lm.log.Warnf("Incomplete CSF SQL sequence at end of result set (scn=%d, op=%s, txn=%s)", pending.SCN, pending.Operation, pending.TransactionID)
 		if err := processEvent(ctx, pending); err != nil {
-			return fmt.Errorf("processing redo event: %w", err)
+			return lastSCN, fmt.Errorf("processing redo event: %w", err)
 		}
+		lastProcessedSCN, haveLastProcessed = pending.SCN, true
 	}
 
-	return nil
+	// The result set is exhausted — nothing more could share lastProcessedSCN, so it's now
+	// confirmed complete too.
+	if haveLastProcessed {
+		lastSCN = lastProcessedSCN
+	}
+
+	return lastSCN, nil
 }
 
 // LogFile represents a redo or archive log file
